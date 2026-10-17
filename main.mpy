@@ -1,0 +1,3291 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 die Autorinnen und Autoren von fuzzymap – entstanden per Vibe Coding (siehe README.md)
+# Quellcode: https://github.com/jhb/fuzzymap
+"""fuzzymap – Fuzzy Cognitive Maps erstellen, speichern und simulieren.
+
+Gesamte Anwendungslogik der PWA, ausgeführt von PyScript (MicroPython) im Browser.
+
+Abschnitte (siehe Kommentare "# ------"):
+    Hilfen                DOM-Zugriff, deutsche Zahlenformate, Parsing
+    Daten                 Kartenmodell, Farben, localStorage (load/save), Beispielkarte
+    Simulation            Rechenmodell simulate() und Anlegen eines Laufs
+    Ansicht               Ansichtsfenster, Zoom, Geometrie, SVG-Rendering der Karte
+    Panel                 Seitenleiste: Inspektor, Listen, Formular, Läufe, Diagramm
+    Simulation abspielen  Abspielleiste und Timer
+    Bearbeiten            Knoten/Kanten anlegen und löschen, Modi
+    Zeiger-Ereignisse     Ziehen, Verbinden, Verschieben, Pinch-Zoom
+    Aktionen              Handler für Buttons mit data-action (Tabelle ACTIONS)
+    Export / Import       JSON/CSV, Dateiimport, Drag & Drop, Meldungen
+    Verknüpftes Hovern    gemeinsame Hervorhebung über Graph, Diagramm und Listen
+    Start                 Listener registrieren, erstes Rendering, Service Worker
+
+Rendering: Jede render_*-Funktion baut HTML/SVG als String und setzt innerHTML.
+Ereignisse werden zentral an document bzw. am <svg> abgefangen (Delegation).
+Details: docs/architektur.md, Datenformat: docs/datenformat.md.
+"""
+import asyncio
+import json
+import math
+import random
+from pyscript import document, window
+from pyscript.ffi import create_proxy, to_js, is_none
+
+# ---------------------------------------------------------------- Sprache
+# Deutsch ist die Quellsprache: _("deutscher Text") liefert bei Englisch die Übersetzung aus EN (weiter unten),
+# fehlt sie, bleibt der deutsche Text stehen. Statische Texte in index.html tragen data-i18n-Schlüssel (EN_STATIC).
+LANG = {"v": "de"}
+
+
+def _(s):
+    if LANG["v"] == "en":
+        return EN.get(s, s)
+    return s
+
+
+def is_en():
+    return LANG["v"] == "en"
+
+
+def dec_sep():
+    return "." if LANG["v"] == "en" else ","
+
+STORE_KEY = "fcm.maps.v1"
+PALETTE = ["#0f7c7c", "#c2410c", "#5b5bd6", "#b7791f", "#2f855a", "#9f3a8a",
+           "#2b6cb0", "#8b5e34", "#c53030", "#6b7d1f", "#0b8bb0", "#64748b"]
+
+S = {
+    "maps": [], "current": None, "sel": None, "mode": "select",
+    "view": {"x": 0.0, "y": 0.0, "w": 1000.0, "h": 700.0},
+    "drag": None, "pending": None, "temp": None,
+    "tab": "edit", "run": None, "round": 0, "timer": None,
+    "settings": {"sizeByValue": False, "panelW": 400, "chartY": "abs"}, "hover": None, "split": False,
+}
+# Laufzeitzustand. Persistiert werden nur "maps", "current" und "settings".
+#   sel      Auswahl {"type": "node"|"edge", "id": ...}
+#   mode     "select" | "node" | "edge"
+#   view     Ansichtsfenster in Weltkoordinaten (viewBox des SVG)
+#   drag     laufende Zeigeraktion; temp = Hilfslinie beim Verbinden; pending = Startknoten beim Antippen
+#   run      ID des geöffneten Laufs; round = angezeigte Runde; timer = Abspiel-Intervall
+#   hover    Knoten-ID, die gerade überall hervorgehoben ist
+PROXIES = []  # Referenzen halten, damit Callbacks nicht eingesammelt werden
+
+
+# ---------------------------------------------------------------- Hilfen
+def el(i):
+    return document.getElementById(i)
+
+
+def attr(node, name):
+    if is_none(node):
+        return None
+    v = node.getAttribute(name)
+    return None if is_none(v) else str(v)
+
+
+def closest(node, sel):
+    if is_none(node) or is_none(node.closest):
+        return None
+    r = node.closest(sel)
+    return None if is_none(r) else r
+
+
+def esc(s):
+    s = str(s)
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+             .replace('"', "&quot;").replace("'", "&#39;"))
+
+
+UID_N = [0]
+
+
+def uid(prefix):
+    """Neue eindeutige ID: Präfix + Zeit + Zähler + Zufall (nur Buchstaben und Ziffern)."""
+    UID_N[0] += 1
+    return "{}{}{}{}".format(prefix, int(window.Date.now()) % 100000000000, UID_N[0],
+                             random.getrandbits(16))
+
+
+def now_iso():
+    return str(window.Date.new().toISOString())
+
+
+def fmt_date(iso):
+    try:
+        return str(window.Date.new(iso).toLocaleString("en-GB" if is_en() else "de-DE", to_js(
+            {"dateStyle": "short", "timeStyle": "short"})))
+    except Exception:
+        return esc(str(iso))
+
+
+def fnum(v, dec=None):
+    v = float(v)
+    if dec is None:
+        a = abs(v)
+        dec = 0 if a >= 1000 else (1 if a >= 10 else 2)
+    s = ("{:." + str(dec) + "f}").format(v)
+    if "." in s and dec > 0:
+        s = s.rstrip("0").rstrip(".")
+    if s == "-0":
+        s = "0"
+    return s.replace("-", "−").replace(".", dec_sep())
+
+
+def pct_sign():
+    return "%" if is_en() else " %"  # Englisch: „+50%“, Deutsch: „+50 %“
+
+
+def fpct(p):
+    a = abs(p)
+    if a < 0.05:
+        return "±0" + pct_sign()
+    dec = 0 if a >= 100 else 1
+    s = ("{:." + str(dec) + "f}").format(a).replace(".", dec_sep())
+    return ("+" if p > 0 else "−") + s + pct_sign()
+
+
+def fweight(w):
+    w = float(w)
+    s = "{:.3f}".format(abs(w)).rstrip("0").rstrip(".").replace(".", dec_sep())
+    if s == "0":
+        return "0"
+    return ("+" if w > 0 else "−") + s
+
+
+def pfloat(s, default=None):
+    try:
+        s = str(s).strip().replace(",", ".").replace("−", "-")
+        if s == "":
+            return default
+        v = float(s)
+        if v != v or abs(v) > 1e300:
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def clamp(v, a, b):
+    return a if v < a else (b if v > b else v)
+
+
+def log10(x):
+    return math.log(x) / math.log(10)
+
+
+# ---------------------------------------------------------------- Daten
+def cur():
+    """Aktive Karte oder None."""
+    for m in S["maps"]:
+        if m["id"] == S["current"]:
+            return m
+    return None
+
+
+def node_by(m, nid):
+    for n in m["nodes"]:
+        if n["id"] == nid:
+            return n
+    return None
+
+
+def edge_by(m, eid):
+    for e in m["edges"]:
+        if e["id"] == eid:
+            return e
+    return None
+
+
+def run_by(m, rid):
+    for r in m["sims"]:
+        if r["id"] == rid:
+            return r
+    return None
+
+
+def free_color(m):
+    """Kleinster noch nicht verwendeter Farbindex der Karte; sind alle belegt, wird rotiert."""
+    used = [n.get("c") for n in m["nodes"] if isinstance(n.get("c"), int)]
+    for k in range(len(PALETTE)):
+        if k not in used:
+            return k
+    return len(used) % len(PALETTE)
+
+
+def node_color(m, nid, run=None):
+    """Feste Farbe eines Knotens – gleich in Graph, Diagramm und Listen."""
+    n = node_by(m, nid) if m else None
+    if n and isinstance(n.get("c"), int):
+        return PALETTE[n["c"] % len(PALETTE)]
+    if run and isinstance(run.get("colors"), dict) and nid in run["colors"]:
+        return PALETTE[int(run["colors"][nid]) % len(PALETTE)]
+    k = run["nodes"].index(nid) if run and nid in run["nodes"] else 0
+    return PALETTE[k % len(PALETTE)]
+
+
+def ensure_map(m):
+    """Ergänzt fehlende Felder einer Karte (auch alter Versionen) und vergibt fehlende Knotenfarben."""
+    m.setdefault("nodes", [])
+    for n in m["nodes"]:
+        if not isinstance(n.get("c"), int):
+            n["c"] = free_color(m)
+    m.setdefault("edges", [])
+    m.setdefault("sims", [])
+    d = m.setdefault("draft", {})
+    d.setdefault("changes", {})
+    d.setdefault("rounds", 12)
+    d["model"] = "abs"
+    d.setdefault("damping", 1.0)
+    if d.get("unit") not in ("pct", "abs"):
+        d["unit"] = "pct"
+    return m
+
+
+def new_map(name):
+    return ensure_map({"id": uid("m"), "name": name, "created": now_iso(),
+                       "updated": now_iso(), "nodes": [], "edges": [], "sims": []})
+
+
+def sample_map():
+    m = new_map(_("Beispiel: Stadtverkehr"))
+    spec = [
+        ("Radverkehr", 100, 160, 140,
+         "Wie viele Wege mit dem Fahrrad zurückgelegt werden. Index: 100 = heutiger Stand."),
+        ("Autoverkehr", 100, 520, 140,
+         "Menge der Fahrten mit dem eigenen Auto. Index: 100 = heutiger Stand."),
+        ("Luftqualität", 100, 340, 360,
+         "Wie sauber die Luft ist – höher ist besser (weniger Stickoxide und Feinstaub). Index: 100 = heutiger Stand."),
+        ("Radwege-Ausbau", 100, -60, 300,
+         "Umfang und Qualität des Radwegenetzes. Hier setzt der vorbereitete Anstoß an: +100 % = doppelt so viele gute Radwege."),
+        ("Parkplatzangebot", 100, 760, 300,
+         "Zahl der öffentlich nutzbaren Parkplätze. Index: 100 = heutiger Stand."),
+        ("ÖPNV-Nutzung", 100, 340, -40,
+         "Fahrgäste in Bus und Bahn. Index: 100 = heutiger Stand."),
+        ("Lärmbelastung", 100, 660, 460,
+         "Verkehrslärm, dem die Anwohnerinnen und Anwohner ausgesetzt sind – höher ist lauter. Index: 100 = heutiger Stand."),
+    ]
+    ids = {}
+    for lab, v, x, y, note in spec:
+        n = {"id": uid("n"), "label": _(lab), "value": v, "x": x, "y": y, "note": _(note)}
+        ids[lab] = n["id"]
+        m["nodes"].append(n)
+    edges = [
+        ("Radwege-Ausbau", "Radverkehr", 0.6,
+         "Sichere, durchgehende Radwege bringen mehr Menschen aufs Rad. Nicht jeder neue Radweg wird voll genutzt, daher etwas mehr als die Hälfte der Änderung."),
+        ("Radverkehr", "Autoverkehr", -0.4,
+         "Wer Rad fährt, lässt oft das Auto stehen. Ein Teil der neuen Radfahrten ersetzt aber Fußwege statt Autofahrten, deshalb nur −0,4."),
+        ("Autoverkehr", "Luftqualität", -0.5,
+         "Abgase und Abrieb verschlechtern die Luft. Heizungen und Industrie tragen ebenfalls bei, deshalb nur die Hälfte der Änderung."),
+        ("Autoverkehr", "Lärmbelastung", 0.7,
+         "Verkehrslärm in Städten stammt überwiegend vom Autoverkehr: mehr Autos bedeuten deutlich mehr Lärm."),
+        ("Parkplatzangebot", "Autoverkehr", 0.5,
+         "Wo man leicht parken kann, fährt man eher mit dem Auto – das Angebot erzeugt zusätzlichen Verkehr."),
+        ("Autoverkehr", "Parkplatzangebot", 0.3,
+         "Mehr Autoverkehr erhöht den Druck, zusätzliche Parkplätze zu schaffen. Zusammen mit der Gegenkante eine sich selbst verstärkende Rückkopplung."),
+        ("ÖPNV-Nutzung", "Autoverkehr", -0.3,
+         "Wer Bus und Bahn nutzt, fährt seltener Auto."),
+        ("Luftqualität", "Radverkehr", 0.2,
+         "Bei sauberer Luft ist Radfahren angenehmer – ein schwacher Effekt. Schließt die verstärkende Schleife Radverkehr → Autoverkehr → Luftqualität → Radverkehr."),
+        ("Radverkehr", "ÖPNV-Nutzung", 0.1,
+         "Rad und ÖPNV ergänzen sich, etwa mit dem Rad zur Haltestelle oder durch Fahrradmitnahme – ein kleiner positiver Effekt."),
+    ]
+    for a, b, w, note in edges:
+        m["edges"].append({"id": uid("e"), "src": ids[a], "dst": ids[b], "w": w, "note": _(note)})
+    m["draft"]["changes"] = {ids["Radwege-Ausbau"]: 100}
+    return ensure_map(m)
+
+
+def load():
+    """Lädt Karten und Einstellungen aus dem localStorage; beim ersten Start die Beispielkarte."""
+    raw = window.localStorage.getItem(STORE_KEY)
+    data = None
+    if not is_none(raw):
+        try:
+            data = json.loads(str(raw))
+        except Exception:
+            data = None
+    if data and data.get("maps"):
+        S["maps"] = [ensure_map(m) for m in data["maps"]]
+        S["current"] = data.get("current")
+        if isinstance(data.get("settings"), dict):
+            S["settings"].update(data["settings"])
+            if data["settings"].get("lang") in ("de", "en"):
+                LANG["v"] = data["settings"]["lang"]
+    else:
+        S["maps"] = [sample_map()]
+    if cur() is None:
+        S["current"] = S["maps"][0]["id"]
+    S["settings"]["lang"] = LANG["v"]
+
+
+RUN_JSON = {}  # Lauf-ID -> (Name, JSON-Text). Läufe sind Momentaufnahmen; geändert wird nur der Name.
+
+
+def run_json(r):
+    c = RUN_JSON.get(r["id"])
+    if c is None or c[0] != r["name"]:
+        c = (r["name"], json.dumps(r))
+        RUN_JSON[r["id"]] = c
+    return c[1]
+
+
+def dump_state():
+    """JSON des kompletten Stands. Läufe (der größte Teil der Daten) kommen aus dem Zwischenspeicher RUN_JSON,
+    damit nicht bei jedem Speichern alle Verläufe neu serialisiert werden."""
+    parts = []
+    for m in S["maps"]:
+        rest = {}
+        for k in m:
+            if k != "sims":
+                rest[k] = m[k]
+        s = json.dumps(rest)
+        parts.append(s[:-1] + ',"sims":[' + ",".join([run_json(r) for r in m.get("sims", [])]) + "]}")
+    return ('{"version":1,"current":' + json.dumps(S["current"]) + ',"settings":' + json.dumps(S["settings"])
+            + ',"maps":[' + ",".join(parts) + "]}")
+
+
+SAVE = {"timer": None}
+
+
+def save():
+    """Schreibt den kompletten Stand (Karten, aktive Karte, Einstellungen) sofort in den localStorage."""
+    if SAVE["timer"] is not None:
+        window.clearTimeout(SAVE["timer"])
+        SAVE["timer"] = None
+    m = cur()
+    if m:
+        m["updated"] = now_iso()
+    try:
+        window.localStorage.setItem(STORE_KEY, dump_state())
+    except Exception as ex:
+        window.alert(_("Speichern fehlgeschlagen: ") + str(ex))
+
+
+def _save_later(*args):
+    SAVE["timer"] = None
+    save()
+
+
+SAVE_LATER = create_proxy(_save_later)
+
+
+def save_soon():
+    """Speichern beim Tippen: erst nach 400 ms Pause, damit Eingaben flüssig bleiben."""
+    if SAVE["timer"] is not None:
+        window.clearTimeout(SAVE["timer"])
+    SAVE["timer"] = window.setTimeout(SAVE_LATER, 400)
+
+
+def flush_save(*args):
+    """Ausstehendes Speichern sofort erledigen (Seite wird verlassen oder ausgeblendet)."""
+    if SAVE["timer"] is not None:
+        save()
+
+
+# ---------------------------------------------------------------- Simulation
+def simulate(m, deltas, rounds, model, damping):
+    """Rundenweise Ausbreitung absoluter Änderungen.
+
+    Jeder Knoten trägt pro Runde ein Signal Δ (die absolute Änderung dieser Runde).
+    Ziel: Δ_j' = d * Σ w_ij * Δ_i,  Wert_j += Δ_j'.
+    Beispiel: Start = 50 verdoppelt sich (Δ = +50), w = 1,0 -> Ziel steigt um 50;
+              w = 0,5 -> Ziel steigt um 25; w = −2 -> Ziel sinkt um 100.
+    deltas = {Knoten-ID: absolute Anfangsänderung} (Prozentangaben vorher mit to_deltas() umrechnen).
+    Runde 0 = Ausgangszustand, Runde 1 = Anstoß (Δ = deltas[id]),
+    danach gibt jede Runde nur die Änderung der Vorrunde weiter.
+    """
+    ids = [n["id"] for n in m["nodes"]]
+    vals = {}
+    for n in m["nodes"]:
+        vals[n["id"]] = float(n["value"])
+    inc = {}
+    for i in ids:
+        inc[i] = []
+    for e in m["edges"]:
+        if e["src"] in vals and e["dst"] in vals:  # Schleifen (src == dst) wirken auf den Knoten selbst
+            inc[e["dst"]].append((e["src"], float(e["w"])))
+
+    sig = {}
+    for i in ids:
+        sig[i] = float(deltas.get(i, 0) or 0)
+
+    history = [[vals[i] for i in ids]]
+    stable = None
+    scale = max([abs(vals[i]) for i in ids] + [1.0])
+    for r in range(1, rounds + 1):
+        if r > 1:
+            nsig = {}
+            for j in ids:
+                acc = 0.0
+                for (i, w) in inc[j]:
+                    acc += w * sig[i]
+                acc *= damping
+                if abs(acc) > 1e250:
+                    acc = 1e250 if acc > 0 else -1e250
+                nsig[j] = acc
+            sig = nsig
+        for i in ids:
+            v = vals[i] + sig[i]
+            if abs(v) > 1e250:
+                v = 1e250 if v > 0 else -1e250
+            vals[i] = v
+        history.append([vals[i] for i in ids])
+        if stable is None and r > 1 and max([abs(sig[i]) for i in ids] + [0]) < 1e-9 * scale:
+            stable = r
+    return ids, history, stable
+
+
+def to_deltas(m, changes, unit):
+    """Rechnet die Anstoß-Eingaben in absolute Änderungen um.
+    unit "pct": Prozent des aktuellen Knotenwerts; unit "abs": Werte sind bereits absolut."""
+    out = {}
+    for nid in changes:
+        n = node_by(m, nid)
+        if not n:
+            continue
+        v = float(changes[nid])
+        out[nid] = v if unit == "abs" else float(n["value"]) * v / 100.0
+    return out
+
+
+def run_sim():
+    """Liest das Simulationsformular, rechnet, speichert den Lauf als Momentaufnahme und spielt ihn ab."""
+    m = cur()
+    if not m or not m["nodes"]:
+        window.alert(_("Die Karte enthält noch keine Knoten."))
+        return
+    read_sim_form()
+    d = m["draft"]
+    ch = {}
+    for k in d["changes"]:
+        v = d["changes"][k]
+        if v and node_by(m, k):
+            ch[k] = v
+    if not ch:
+        if not window.confirm(_("Es ist keine Änderung angegeben. Trotzdem simulieren?")):
+            return
+    unit = d.get("unit", "pct")
+    deltas = to_deltas(m, ch, unit)
+    ids, hist, stable = simulate(m, deltas, int(d["rounds"]), d["model"], float(d["damping"]))
+    name = str(el("sim-name").value).strip() or _("Lauf {}").format(len(m["sims"]) + 1)
+    labels = {}
+    for n in m["nodes"]:
+        labels[n["id"]] = n["label"]
+    run = {"id": uid("r"), "name": name, "created": now_iso(), "model": d["model"],
+           "rounds": int(d["rounds"]), "damping": float(d["damping"]), "changes": ch,
+           "unit": unit, "deltas": deltas,
+           "nodes": ids, "labels": labels, "history": hist, "stable": stable,
+           "edges": [dict(e) for e in m["edges"]],
+           "colors": dict([(n["id"], n.get("c", 0)) for n in m["nodes"]])}
+    m["sims"].insert(0, run)
+    el("sim-name").value = ""
+    save()
+    open_run(run["id"], 0)
+    set_tab("runs")
+    play()
+
+
+# ---------------------------------------------------------------- Ansicht
+def stage_rect():
+    return el("canvas").getBoundingClientRect()
+
+
+def fix_aspect():
+    r = stage_rect()
+    if r.width > 0 and r.height > 0:
+        v = S["view"]
+        v["h"] = v["w"] * float(r.height) / float(r.width)
+
+
+def to_world(e):
+    r = stage_rect()
+    v = S["view"]
+    x = v["x"] + (float(e.clientX) - float(r.left)) / max(1.0, float(r.width)) * v["w"]
+    y = v["y"] + (float(e.clientY) - float(r.top)) / max(1.0, float(r.height)) * v["h"]
+    return x, y
+
+
+def zoom(f, cx=None, cy=None):
+    v = S["view"]
+    if cx is None:
+        cx = v["x"] + v["w"] / 2
+        cy = v["y"] + v["h"] / 2
+    nw = clamp(v["w"] * f, 200.0, 8000.0)
+    f = nw / v["w"]
+    v["x"] = cx - (cx - v["x"]) * f
+    v["y"] = cy - (cy - v["y"]) * f
+    v["w"] = nw
+    v["h"] = v["h"] * f
+    render_canvas()
+
+
+def fit():
+    m = cur()
+    r = stage_rect()
+    asp = float(r.height) / float(r.width) if r.width else 0.7
+    v = S["view"]
+    if not m or not m["nodes"]:
+        v["x"], v["y"], v["w"] = -500.0, -350.0, 1000.0
+        v["h"] = v["w"] * asp
+        render_canvas()
+        return
+    xs = [n["x"] for n in m["nodes"]]
+    ys = [n["y"] for n in m["nodes"]]
+    for e in m["edges"]:  # Schleifen ragen aus dem Knoten heraus
+        n = node_by(m, e["src"]) if e["src"] == e["dst"] else None
+        if n:
+            ux, uy = loop_side(m, n)
+            w, h = node_size(n)
+            r = (h if uy != 0 else w) / 2.0 + 30.0
+            xs.append(n["x"] + ux * r)
+            ys.append(n["y"] + uy * r)
+    pad = 140.0
+    x0, x1 = min(xs) - pad, max(xs) + pad
+    y0, y1 = min(ys) - pad * 0.7, max(ys) + pad * 0.7
+    w = max(x1 - x0, (y1 - y0) / asp, 500.0)
+    h = w * asp
+    v["x"] = (x0 + x1) / 2 - w / 2
+    v["y"] = (y0 + y1) / 2 - h / 2
+    v["w"], v["h"] = w, h
+    render_canvas()
+
+
+SIZE_MIN, SIZE_RANGE = 0.7, 0.6   # Skalierung 0,7 … 1,3 (symmetrisch um 1)
+
+
+def node_scales(m, rs):
+    """Skalierungsfaktor je Knoten (0,7 … 1,3) bei *Größe nach Wert*, sonst 1.
+    Ohne Simulation: linear über den Wertebereich der Karte – kleinster Wert (auch negativ) = kleinster Knoten,
+    größter = größter (Fläche wächst mit dem Anteil, daher Wurzel). Alle Werte gleich = Normalgröße.
+    In der Simulation: Änderung gegenüber Runde 0, gemessen am eigenen Startwert des Knotens; unverändert = 1,
+    Anstieg größer, Rückgang kleiner, logarithmisch gedämpft (+100 % = Maximum, −100 % = Minimum).
+    Knoten mit Startwert 0 werden an der größten absoluten Änderung solcher Knoten im ganzen Lauf gemessen."""
+    sc = {}
+    if not S["settings"].get("sizeByValue"):
+        for n in m["nodes"]:
+            sc[n["id"]] = 1.0
+        return sc
+    if not rs:
+        vals = [float(n["value"]) for n in m["nodes"]]
+        lo = min(vals) if vals else 0.0
+        hi = max(vals) if vals else 0.0
+        for n in m["nodes"]:
+            if hi - lo > 0:
+                f = (float(n["value"]) - lo) / (hi - lo)
+                sc[n["id"]] = SIZE_MIN + SIZE_RANGE * math.sqrt(f)
+            else:
+                sc[n["id"]] = 1.0
+        return sc
+    run, now, prev, start, t = rs
+    zero = [k for k, nid in enumerate(run["nodes"]) if start.get(nid, 1.0) == 0]
+    dmax = 0.0
+    for row in run["history"]:
+        for k in zero:
+            if abs(row[k]) > dmax:
+                dmax = abs(row[k])
+    up = SIZE_MIN + SIZE_RANGE - 1.0
+    down = 1.0 - SIZE_MIN
+    for n in m["nodes"]:
+        nid = n["id"]
+        if nid not in now:
+            sc[nid] = 1.0
+            continue
+        d = now[nid] - start[nid]
+        if start[nid] != 0:
+            r = d / abs(start[nid])
+            g = math.log(1 + abs(r)) / math.log(2)
+            if r < 0:
+                g = -g
+        else:
+            g = d / dmax if dmax > 0 else 0.0
+        g = clamp(g, -1.0, 1.0)
+        sc[nid] = 1.0 + (g * up if g > 0 else g * down)
+    return sc
+
+
+def node_size(n):
+    lab = n["label"] or " "
+    return min(230, max(100, int(len(lab) * 7.8) + 34)), 58
+
+
+def border_pt(cx, cy, hw, hh, tx, ty):
+    """Schnittpunkt der Strecke vom Rechteckmittelpunkt (cx, cy) Richtung (tx, ty) mit dem Rechteckrand."""
+    dx, dy = tx - cx, ty - cy
+    if dx == 0 and dy == 0:
+        return cx, cy
+    sx = hw / abs(dx) if dx else 1e9
+    sy = hh / abs(dy) if dy else 1e9
+    t = min(sx, sy)
+    return cx + dx * t, cy + dy * t
+
+
+def run_state():
+    """Liefert (run, werte_jetzt, werte_vorher, werte_start) für die aktive Simulation."""
+    m = cur()
+    if not m or not S["run"]:
+        return None
+    run = run_by(m, S["run"])
+    if not run:
+        return None
+    t = clamp(S["round"], 0, len(run["history"]) - 1)
+    idx = {}
+    for k, nid in enumerate(run["nodes"]):
+        idx[nid] = k
+    now = {}
+    prev = {}
+    start = {}
+    for nid in idx:
+        k = idx[nid]
+        now[nid] = run["history"][t][k]
+        prev[nid] = run["history"][max(0, t - 1)][k]
+        start[nid] = run["history"][0][k]
+    return run, now, prev, start, t
+
+
+def rel(a, b):
+    if b == 0:
+        return 0.0
+    return (a / b - 1.0) * 100.0
+
+
+def render_canvas():
+    """Zeichnet die aktive Karte als SVG: Raster, Kanten, Kantenetiketten, Knoten (ggf. mit Simulationszustand)."""
+    m = cur()
+    svg = el("canvas")
+    fix_aspect()
+    v = S["view"]
+    svg.setAttribute("viewBox", "{} {} {} {}".format(v["x"], v["y"], v["w"], v["h"]))
+    if not m:
+        svg.innerHTML = ""
+        return
+    rs = run_state()
+    SC = node_scales(m, rs)
+    nodes = {}
+    for n in m["nodes"]:
+        nodes[n["id"]] = n
+    pairs = {}
+    for e in m["edges"]:
+        pairs[e["src"] + ">" + e["dst"]] = True
+    sel = S["sel"] or {}
+    out = []
+    out.append(
+        '<defs>'
+        '<pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse">'
+        '<circle cx="1.5" cy="1.5" r="1.3" class="dot"/></pattern>')
+    for k in ["pos", "neg", "zero", "sel"]:
+        out.append('<marker id="ah-{0}" viewBox="0 0 10 10" refX="9" refY="5" '
+                   'markerWidth="11" markerHeight="11" markerUnits="userSpaceOnUse" '
+                   'orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="ah-{0}"/></marker>'
+                   .format(k))
+    out.append('</defs>')
+    out.append('<rect x="{}" y="{}" width="{}" height="{}" fill="url(#dots)" class="bg"/>'.format(
+        v["x"] - 2, v["y"] - 2, v["w"] + 4, v["h"] + 4))
+
+    # Kanten
+    labels_out = []
+    EDGE_GEO.clear()
+    for e in m["edges"]:
+        a = nodes.get(e["src"])
+        b = nodes.get(e["dst"])
+        if not a or not b:
+            continue
+        if a is b:
+            loop_svg(m, e, a, SC.get(a["id"], 1.0), sel, rs, out, labels_out)
+            continue
+        aw, ah = node_size(a)
+        bw, bh = node_size(b)
+        fa, fb = SC.get(a["id"], 1.0), SC.get(b["id"], 1.0)
+        aw, ah, bw, bh = aw * fa, ah * fa, bw * fb, bh * fb
+        ax, ay, bx, by = a["x"], a["y"], b["x"], b["y"]
+        mx, my = (ax + bx) / 2, (ay + by) / 2
+        dx, dy = bx - ax, by - ay
+        L = math.sqrt(dx * dx + dy * dy) or 1.0
+        off = 34.0 if (e["dst"] + ">" + e["src"]) in pairs else 0.0
+        cx, cy = mx - dy / L * off, my + dx / L * off
+        sx, sy = border_pt(ax, ay, aw / 2 + 3, ah / 2 + 3, cx, cy)
+        ex, ey = border_pt(bx, by, bw / 2 + 5, bh / 2 + 5, cx, cy)
+        w = float(e["w"])
+        kind = "pos" if w > 0 else ("neg" if w < 0 else "zero")
+        is_sel = sel.get("type") == "edge" and sel.get("id") == e["id"]
+        cls = "edge " + kind + (" sel" if is_sel else "")
+        if rs:
+            run, now, prev, start, t = rs
+            if e["src"] in now and t >= 1 and t < len(run["history"]) - 1 and abs(now[e["src"]] - prev[e["src"]]) > 1e-9 * max(1.0, abs(prev[e["src"]])) and w != 0:
+                cls += " active"
+        d = "M{:.1f} {:.1f} Q{:.1f} {:.1f} {:.1f} {:.1f}".format(sx, sy, cx, cy, ex, ey)
+        sw = 1.4 + 4.0 * min(1.0, abs(w) / 2.0)
+        out.append('<g data-edge="{}" data-ends="{} {}" class="{}"><path d="{}" class="hit"/>'
+                   '<path d="{}" class="line" style="stroke-width:{:.2f}" marker-end="url(#ah-{})"/></g>'
+                   .format(e["id"], e["src"], e["dst"], cls, d, d, sw, "sel" if is_sel else kind))
+        lx = 0.25 * sx + 0.5 * cx + 0.25 * ex
+        ly = 0.25 * sy + 0.5 * cy + 0.25 * ey
+        EDGE_GEO[e["id"]] = (lx, ly)
+        labels_out.append('<g data-edge="{}" data-ends="{} {}" class="elabel {}{}" transform="translate({:.1f},{:.1f})">'
+                          '<rect x="{:.1f}" y="-11" width="{:.1f}" height="22" rx="11"/>'
+                          '<text y="4.5">{}</text>{}</g>'.format(
+                              e["id"], e["src"], e["dst"], kind, " sel" if is_sel else "", lx, ly,
+                              -pill_w(w) / 2, pill_w(w), fweight(w), note_dot(e, pill_w(w))))
+    out.extend(labels_out)
+
+    if S["temp"]:
+        t0 = S["temp"]
+        out.append('<line class="temp" x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}"/>'.format(
+            t0[0], t0[1], t0[2], t0[3]))
+
+    # Knoten
+    NODE_GEO.clear()
+    NODE_INFO.clear()
+    for n in m["nodes"]:
+        w, h = node_size(n)
+        f = SC.get(n["id"], 1.0)
+        NODE_GEO[n["id"]] = (float(n["x"]), float(n["y"]), h * f / 2.0)
+        cur_val = float(n["value"])
+        is_sel = sel.get("type") == "node" and sel.get("id") == n["id"]
+        cls = "node"
+        if is_sel:
+            cls += " sel"
+        if S["pending"] == n["id"]:
+            cls += " pending"
+        value_txt = fnum(n["value"])
+        badge = ""
+        kfill = 14
+        if rs:
+            run, now, prev, start, t = rs
+            if n["id"] in now:
+                s0 = start[n["id"]]
+                dv = now[n["id"]] - s0
+                tol = 1e-9 * max(1.0, abs(s0))
+                k = clamp(abs(dv) / abs(s0), 0.0, 1.0) if s0 else 1.0
+                if abs(dv) > tol:
+                    cls += " up" if dv > 0 else " down"
+                    kfill = 22 + 50 * k
+                value_txt = fnum(now[n["id"]])
+                NODE_INFO[n["id"]] = (n["label"] or _("(ohne Text)"), now[n["id"]], s0, dv, t)
+                cur_val = now[n["id"]]
+                step = now[n["id"]] - prev[n["id"]]
+                if abs(dv) > tol:
+                    bcls = "pos" if dv > 0 else "neg"
+                    # Prozent gegenüber Runde 0; bei Startwert 0 ist kein Prozent möglich → absolute Änderung
+                    bt = fpct(dv / s0 * 100.0) if abs(s0) > 1e-12 else fsigned(dv)
+                    bw = len(bt) * 7.2 + 14
+                    badge = ('<g class="badge {}" transform="translate({:.1f},{:.1f})">'
+                             '<rect x="{:.1f}" y="-11" width="{:.1f}" height="22" rx="11"/>'
+                             '<text y="4.5">{}</text></g>').format(
+                                 bcls, w * f / 2 - 8, -h * f / 2 - 4, -bw / 2, bw, bt)
+                step = 100.0 if abs(step) > tol else 0.0
+                if t > 0 and abs(step) >= 0.05:
+                    cls += " pulse"
+            else:
+                cls += " ghost"
+        if cur_val < 0:
+            cls += " negv"
+        style = ' style="--nc:{};--k:{:.0f}%"'.format(node_color(m, n["id"]), kfill)
+        lab = n["label"] or _("(ohne Text)")
+        short = lab if len(lab) <= 27 else lab[:26] + "…"
+        out.append(
+            '<g data-node="{id}" data-hl="{id}" class="{cls}"{st} transform="translate({x:.1f},{y:.1f})">'
+            '{title}<g class="body" transform="scale({f:.3f})">'
+            '<rect x="{rx:.1f}" y="{ry:.1f}" width="{w}" height="{h}" rx="12"/>'
+            '<text class="nl" y="-4">{lab}</text>'
+            '<text class="nv" y="16">{val}</text></g>{badge}{nm}</g>'.format(
+                id=n["id"], cls=cls, st=style, x=n["x"], y=n["y"], f=f,
+                title="",  # Hover-Anzeige übernimmt (node_tip)
+                rx=-w / 2, ry=-h / 2, w=w, h=h, lab=esc(short), val=value_txt, badge=badge,
+                nm=('<circle class="note-dot" cx="{:.1f}" cy="{:.1f}" r="3.5"/>'.format(-w * f / 2 + 9, -h * f / 2 + 9)
+                    if n.get("note") else "")))
+    svg.innerHTML = "".join(out)
+    apply_hover()
+    render_hint()
+    position_inline_edit()
+
+
+NODE_GEO = {}   # Knoten-ID -> (x, y, halbe Höhe) in Weltkoordinaten, für die Hover-Anzeige
+NODE_INFO = {}  # Knoten-ID -> (Text, Wert, Startwert, Änderung, Runde) im geöffneten Lauf
+EDGE_GEO = {}  # Kanten-ID -> (x, y) des Faktor-Etiketts (für die Hover-Anzeige)
+
+
+def note_dot(e, pw):
+    """Kleiner Punkt rechts am Faktor-Etikett: Kante hat eine Beschreibung."""
+    if not e.get("note"):
+        return ""
+    return '<circle class="note-dot" cx="{:.1f}" cy="-9" r="3.5"/>'.format(pw / 2 - 3)
+
+
+def node_tip():
+    """Hover-Anzeige auf der Fläche.
+
+    Knoten im Lauf: Wert, Startwert, Änderung absolut und in Prozent (+ Beschreibung).
+    Knoten ohne Lauf: Text und Wert; Kanten: Start → Ziel und Faktor – jeweils mit Beschreibung, falls vorhanden."""
+    tip = el("node-tip")
+    if is_none(tip):
+        return
+    m = cur()
+    nid = S.get("hover")
+    eid = S.get("ehover")
+    if not m or S.get("drag") or EDIT.get("id"):
+        tip.hidden = True
+        return
+    html = None
+    ed = edge_by(m, eid) if eid else None
+    if ed and eid in EDGE_GEO:
+        a, b = node_by(m, ed["src"]), node_by(m, ed["dst"])
+        x, y = EDGE_GEO[eid]
+        hh = 12.0
+        html = (_('<b>{a} {arr} {b}</b><span>Faktor: <strong>{w}</strong></span>')).format(
+            a=esc(a["label"] if a else "?"), b=esc(b["label"] if b else "?"),
+            arr="↻" if ed["src"] == ed["dst"] else "→", w=fweight(ed["w"]))
+        if ed.get("note"):
+            html += '<span class="tip-note">{}</span>'.format(note_html(ed["note"]))
+    elif nid and nid in NODE_GEO:
+        n = node_by(m, nid)
+        note = (n.get("note") or "") if n else ""
+        x, y, hh = NODE_GEO[nid]
+        if S.get("run") and nid in NODE_INFO:
+            lab, val, s0, dv, t = NODE_INFO[nid]
+            cls = "pos" if dv > 1e-12 else ("neg" if dv < -1e-12 else "")
+            if abs(dv) <= 1e-12:
+                chg = _("keine")
+            elif s0:
+                chg = "{} / {}".format(fsigned(dv), fpct(dv / abs(s0) * 100.0))
+            else:
+                chg = fsigned(dv) + _(" <small>(Start 0, kein %)</small>")
+            html = (_('<b><i class="sw" style="background:{col}"></i>{lab}</b>'
+                      '<span>Runde {t}: <strong>{val}</strong></span>'
+                      '<span>Start: {s0}</span>'
+                      '<span>Änderung: <em class="{cls}">{chg}</em></span>')).format(
+                col=node_color(m, nid), lab=esc(lab), t=t, val=fnum(val), s0=fnum(s0), cls=cls, chg=chg)
+        elif n and not S.get("run"):
+            html = (_('<b><i class="sw" style="background:{col}"></i>{lab}</b>'
+                      '<span>Wert: <strong>{val}</strong></span>')).format(
+                col=node_color(m, nid), lab=esc(n["label"] or _("(ohne Text)")), val=fnum(n["value"]))
+        if html is not None and note:
+            html += '<span class="tip-note">{}</span>'.format(note_html(note))
+    if html is None:
+        tip.hidden = True
+        return
+    v = S["view"]
+    fx = (x - v["x"]) / v["w"]
+    top = (y - hh - v["y"]) / v["h"]
+    below = top < 0.18
+    fy = (y + hh - v["y"]) / v["h"] if below else top
+    if fx < -0.05 or fx > 1.05 or fy < -0.05 or fy > 1.05:
+        tip.hidden = True
+        return
+    tip.innerHTML = html
+    tip.style.left = "{:.2f}%".format(clamp(fx, 0.0, 1.0) * 100)
+    tip.style.top = "{:.2f}%".format(clamp(fy, 0.0, 1.0) * 100)
+    tip.className = "node-tip" + (" below" if below else "") + (" right" if fx < 0.15 else (" left" if fx > 0.85 else ""))
+    tip.hidden = False
+
+
+def render_hint():
+    m = cur()
+    hint = el("hint")
+    if S["run"]:
+        txt = _("Simulation: Etikett = Änderung seit Runde 0 in %, Zeiger auf Knoten = Wert, Startwert und Änderung, kräftigere Füllung = größere Änderung.")
+    elif S["mode"] == "node":
+        txt = _("Tippe auf eine freie Stelle, um einen Knoten anzulegen.")
+    elif S["mode"] == "edge":
+        if S["pending"]:
+            txt = _("Jetzt den Zielknoten antippen – denselben Knoten noch einmal für eine Schleife.")
+        else:
+            txt = _("Von einem Knoten zum Zielknoten ziehen – oder nacheinander Start und Ziel antippen. Schleife: Knoten zweimal antippen.")
+    elif m and not m["nodes"]:
+        txt = _("Leere Karte. Doppelklick auf die Fläche oder „+ Knoten“ wählen.")
+    else:
+        txt = _("Knoten ziehen zum Verschieben, Fläche ziehen zum Bewegen, Mausrad zum Zoomen. Doppelklick auf die Fläche legt einen Knoten an, auf einen Knoten bearbeitet seinen Text.")
+    hint.textContent = txt
+
+
+# ---------------------------------------------------------------- Panel
+def render_maps():
+    sel = el("map-select")
+    opts = []
+    for m in S["maps"]:
+        opts.append('<option value="{}"{}>{}</option>'.format(
+            m["id"], " selected" if m["id"] == S["current"] else "", esc(m["name"])))
+    sel.innerHTML = "".join(opts)
+
+
+QUICK_W = [0.125, 0.25, 0.5, 0.75, 1, -0.125, -0.25, -0.5, -0.75, -1]  # Schnellwahl Faktor: oben positiv, unten negativ, je Spalte gleicher Betrag
+NOTE_MAX = 2000
+
+
+def note_field(fid, obj):
+    """Mehrzeiliges Feld „Beschreibung“ für Knoten und Kanten; der Text erscheint beim Darüberfahren."""
+    return ('<label>{}<textarea id="{}" rows="3" maxlength="{}" placeholder="{}">{}</textarea></label>').format(
+        _("Beschreibung"), fid, NOTE_MAX, esc(_("Wird beim Darüberfahren angezeigt")), esc(obj.get("note") or ""))
+
+
+def note_html(t):
+    return esc(t).replace("\n", "<br>")
+
+
+def render_inspector():
+    m = cur()
+    box = el("inspector")
+    sel = S["sel"]
+    if not m:
+        box.innerHTML = ""
+        return
+    if sel and sel["type"] == "node" and node_by(m, sel["id"]):
+        n = node_by(m, sel["id"])
+        ins = [e for e in m["edges"] if e["dst"] == n["id"]]
+        outs = [e for e in m["edges"] if e["src"] == n["id"]]
+
+        def elist(es, other_key, arrow):
+            if not es:
+                return _('<li class="muted">keine</li>')
+            r = []
+            for e in es:
+                o = node_by(m, e[other_key])
+                r.append('<li><button class="link" data-action="select-edge" data-id="{}">{} {} <b class="w {}">{}</b></button></li>'.format(
+                    e["id"], arrow, esc(o["label"] if o else "?"),
+                    "pos" if e["w"] > 0 else ("neg" if e["w"] < 0 else ""), fweight(e["w"])))
+            return "".join(r)
+        warn = ""
+        box.innerHTML = (
+            _('<div class="card"><div class="card-head"><h2>Knoten</h2>'
+            '<button class="danger small" data-action="delete-sel">Löschen</button></div>'
+            '<label>Text<input type="text" id="f-node-label" value="{lab}" autocomplete="off"></label>'
+            '<label>Wert<input type="number" step="any" id="f-node-value" value="{val}"></label>{warn}{notef}'
+            '<div class="grid2 rel"><div><h4>Eingehend</h4><ul class="mini">{ins}</ul></div>'
+            '<div><h4>Ausgehend</h4><ul class="mini">{outs}</ul></div></div>'
+            '<div class="row"><button class="small" data-action="edge-from-sel">Kante von hier ziehen</button>{loop}</div></div>')
+        ).format(lab=esc(n["label"]), val=n["value"], warn=warn, notef=note_field("f-node-note", n),
+                 loop="" if any_loop(m, n["id"]) else _('<button class="small" data-action="edge-self">Schleife auf sich selbst</button>'),
+                 ins=elist(ins, "src", "←"), outs=elist(outs, "dst", "→"))
+        return
+    if sel and sel["type"] == "edge" and edge_by(m, sel["id"]):
+        e = edge_by(m, sel["id"])
+        a = node_by(m, e["src"])
+        b = node_by(m, e["dst"])
+        quick = "".join(['<button class="small" data-action="edge-set" data-w="{}">{}</button>'.format(q, fweight(q))
+                         for q in QUICK_W])
+        box.innerHTML = (
+            _('<div class="card"><div class="card-head"><h2>Kante</h2>'
+            '<button class="danger small" data-action="delete-sel">Löschen</button></div>'
+            '<p class="route"><b>{a}</b> <span>{arr}</span> <b>{b}</b></p>'
+            '<label>Faktor<div class="wrow"><input type="range" id="f-edge-range" min="-10" max="10" step="0.1" value="{w}">'
+            '<input type="number" id="f-edge-num" min="-10" max="10" step="0.05" value="{w}"></div></label>'
+            '<div class="row quick">{quick}</div>{notef}'
+            '<p class="note" id="edge-explain">{ex}</p>'
+            '{rev}</div>')
+        ).format(a=esc(a["label"] if a else "?"), b=esc(b["label"] if b else "?"),
+                 arr=_("↻ Schleife ↻") if e["src"] == e["dst"] else "→",
+                 rev="" if e["src"] == e["dst"] else _('<button class="small" data-action="edge-reverse">Richtung umkehren</button>'),
+                 w=e["w"], quick=quick, ex=edge_explain(e, a, b), notef=note_field("f-edge-note", e))
+        return
+    box.innerHTML = (
+        _('<div class="card empty"><h2>Nichts ausgewählt</h2>'
+        '<p class="note">Wähle einen Knoten oder eine Kante auf der Fläche, um Text, Wert oder Faktor zu ändern.</p>'
+        '<p class="note"><b>Faktor</b> zwischen −10 und +10: Anteil der absoluten Änderung des Startknotens, '
+        'um den sich der Zielknoten ändert. Start 50 verdoppelt sich (+50), Faktor 1,0 → Ziel +50; Faktor 0,5 → Ziel +25.</p>'
+        '<p class="note">Tastatur: V Auswählen · N Knoten · K Kante · Entf Löschen · F Einpassen · G Größe nach Wert · M Vollbild · ? Hilfe</p></div>'))
+
+
+LOOP_DIRS = [(0.0, -1.0), (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0)]  # oben, rechts, links, unten
+
+
+def pill_w(w):
+    """Breite des Faktor-Etiketts: 42 für kurze Werte wie „+0,5“, breiter für z. B. „−10,125“."""
+    return max(42.0, len(fweight(w)) * 7.0 + 14.0)
+
+
+def loop_side(m, n):
+    """Seite für eine Schleife: die Richtung mit dem größten Winkelabstand zu den übrigen Kanten des Knotens."""
+    angs = []
+    for e in m["edges"]:
+        if e["src"] == e["dst"]:
+            continue
+        oid = e["dst"] if e["src"] == n["id"] else (e["src"] if e["dst"] == n["id"] else None)
+        o = node_by(m, oid) if oid else None
+        if o:
+            angs.append(math.atan2(float(o["y"]) - float(n["y"]), float(o["x"]) - float(n["x"])))
+    best, best_d = LOOP_DIRS[0], -1.0
+    for u in LOOP_DIRS:
+        a0 = math.atan2(u[1], u[0])
+        dmin = math.pi
+        for a in angs:
+            dd = abs((a - a0 + math.pi) % (2 * math.pi) - math.pi)
+            dmin = min(dmin, dd)
+        if dmin > best_d + 0.2:  # kleine Unterschiede: Reihenfolge (oben zuerst) entscheidet
+            best, best_d = u, dmin
+    return best
+
+
+def loop_svg(m, e, n, f, sel, rs, out, labels_out):
+    """Schleife als Bogen an der freiesten Seite des Knotens, Pfeil zurück in den Knoten."""
+    w, h = node_size(n)
+    hw, hh = w * f / 2.0, h * f / 2.0
+    ux, uy = loop_side(m, n)
+    px, py = -uy, ux  # senkrecht dazu
+    cx, cy = float(n["x"]), float(n["y"])
+    r = hh if uy != 0 else hw          # Abstand Mitte -> Rand in Richtung u
+    s = min(16.0, (hw if uy != 0 else hh) * 0.6)  # halber Abstand der Fußpunkte
+    reach = 64.0
+    sx, sy = cx + ux * (r + 2) + px * s, cy + uy * (r + 2) + py * s
+    ex, ey = cx + ux * (r + 5) - px * s, cy + uy * (r + 5) - py * s
+    c1x, c1y = cx + ux * (r + reach) + px * (s + 34), cy + uy * (r + reach) + py * (s + 34)
+    c2x, c2y = cx + ux * (r + reach) - px * (s + 34), cy + uy * (r + reach) - py * (s + 34)
+    wv = float(e["w"])
+    kind = "pos" if wv > 0 else ("neg" if wv < 0 else "zero")
+    is_sel = sel.get("type") == "edge" and sel.get("id") == e["id"]
+    cls = "edge loop " + kind + (" sel" if is_sel else "")
+    if rs:
+        run, now, prev, start, t = rs
+        if e["src"] in now and t >= 1 and t < len(run["history"]) - 1 and abs(now[e["src"]] - prev[e["src"]]) > 1e-9 * max(1.0, abs(prev[e["src"]])) and wv != 0:
+            cls += " active"
+    d = "M{:.1f} {:.1f} C{:.1f} {:.1f} {:.1f} {:.1f} {:.1f} {:.1f}".format(sx, sy, c1x, c1y, c2x, c2y, ex, ey)
+    sw = 1.4 + 4.0 * min(1.0, abs(wv) / 2.0)
+    out.append('<g data-edge="{}" data-ends="{} {}" class="{}"><path d="{}" class="hit"/>'
+               '<path d="{}" class="line" style="stroke-width:{:.2f}" marker-end="url(#ah-{})"/></g>'
+               .format(e["id"], e["src"], e["dst"], cls, d, d, sw, "sel" if is_sel else kind))
+    lx = (sx + 3 * c1x + 3 * c2x + ex) / 8.0  # Scheitel des Bogens (t = 0,5)
+    ly = (sy + 3 * c1y + 3 * c2y + ey) / 8.0
+    EDGE_GEO[e["id"]] = (lx, ly)
+    labels_out.append('<g data-edge="{}" data-ends="{} {}" class="elabel {}{}" transform="translate({:.1f},{:.1f})">'
+                      '<rect x="{:.1f}" y="-11" width="{:.1f}" height="22" rx="11"/>'
+                      '<text y="4.5">{}</text>{}</g>'.format(
+                          e["id"], e["src"], e["dst"], kind, " sel" if is_sel else "", lx, ly,
+                          -pill_w(wv) / 2, pill_w(wv), fweight(wv), note_dot(e, pill_w(wv))))
+
+
+def edge_explain(e, a, b):
+    w = float(e["w"])
+    if a is not None and b is not None and a is b:
+        an = esc(a["label"])
+        av = float(a["value"])
+        art = _("Selbstverstärkung") if w > 0 else (_("Selbstdämpfung") if w < 0 else _("ohne Wirkung"))
+        return (_("Schleife ({}): Ändert sich <b>{}</b> in einer Runde, z. B. Verdoppelung von {} auf {} ({}), "
+                "kommt in der nächsten Runde noch einmal <b>{}</b> hinzu. "
+                "Allgemein: zusätzliche Änderung = {} × Änderung der Vorrunde.")).format(
+            art, an, fnum(av), fnum(2 * av), fsigned(av), fsigned(w * av), fweight(w))
+    an = esc(a["label"] if a else _("Start"))
+    bn = esc(b["label"] if b else _("Ziel"))
+    av = float(a["value"]) if a else 0.0
+    return (_("Verdoppelt sich <b>{}</b> (von {} auf {}, also {}), ändert sich <b>{}</b> um <b>{}</b>. "
+            "Allgemein: Änderung Ziel = {} × Änderung Start.")).format(
+        an, fnum(av), fnum(2 * av), fsigned(av), bn, fsigned(w * av), fweight(w))
+
+
+def fsigned(v):
+    if abs(v) < 1e-12:
+        return "±0"
+    return ("+" if v > 0 else "") + fnum(v)
+
+
+def render_node_list():
+    m = cur()
+    ul = el("node-list")
+    if not m or not m["nodes"]:
+        ul.innerHTML = _('<li class="muted">Noch keine Knoten.</li>')
+        return
+    sel = S["sel"] or {}
+    r = []
+    for n in sorted(m["nodes"], key=lambda x: x["label"].lower()):
+        on = sel.get("type") == "node" and sel.get("id") == n["id"]
+        deg = len([e for e in m["edges"] if e["src"] == n["id"] or e["dst"] == n["id"]])
+        r.append(_('<li data-hl="{id}"><button class="row-btn{on}" data-action="select-node" data-id="{id}">'
+                 '<span><i class="sw" style="background:{col}"></i>{lab}</span><span class="num">{val} · {deg}</span></button></li>').format(
+                     on=" on" if on else "", id=n["id"], col=node_color(m, n["id"]),
+                     lab=esc(n["label"] or _("(ohne Text)")), val=fnum(n["value"]), deg=(_("1 Kante") if deg == 1 else _("{} Kanten").format(deg))))
+    ul.innerHTML = "".join(r)
+    apply_hover()
+
+
+MODEL_NOTE = (_("Absolut: Jede Runde gibt ein Knoten seine absolute Änderung der Vorrunde weiter. "
+              "Ziel ändert sich um Faktor × Änderung des Starts (Faktoren mehrerer Eingänge addieren sich)."))
+
+
+UNIT_NOTES = {
+    "pct": _("In Prozent des aktuellen Werts: +100 = verdoppeln (Wert 50 → +50), −50 = halbieren. Leer = keine Änderung."),
+    "abs": _("Als absoluter Betrag, der zum Wert addiert wird: +25 bei Wert 50 ergibt 75, −10 ergibt 40. Leer = keine Änderung."),
+}
+
+
+def preview_txt(n, v, unit):
+    """Vorschau "→ neuer Wert (Änderung)" für eine Anstoß-Eingabe."""
+    if v is None or v == 0:
+        return ""
+    val = float(n["value"])
+    dv = v if unit == "abs" else val * v / 100.0
+    extra = ""
+    if unit == "abs" and val:
+        extra = " · " + fpct(dv / val * 100.0)
+    elif unit == "pct":
+        extra = " · " + fsigned(dv)
+    return "→ {}{}".format(fnum(val + dv), extra)
+
+
+def render_sim_form():
+    m = cur()
+    if not m:
+        return
+    d = m["draft"]
+    unit = d.get("unit", "pct")
+    el("sim-rounds").value = str(d["rounds"])
+    el("sim-damping").value = str(d["damping"])
+    el("model-note").textContent = _(MODEL_NOTE)
+    el("unit-pct").checked = unit == "pct"
+    el("unit-abs").checked = unit == "abs"
+    el("unit-note").textContent = _(UNIT_NOTES[unit])
+    el("chg-head").textContent = _("Änderung %") if unit == "pct" else _("Änderung absolut")
+    body = el("changes-body")
+    if not m["nodes"]:
+        body.innerHTML = _('<tr><td colspan="4" class="muted">Noch keine Knoten.</td></tr>')
+        return
+    r = []
+    for n in m["nodes"]:
+        v = d["changes"].get(n["id"])
+        r.append('<tr data-hl="{id}"><td><i class="sw" style="background:{col}"></i>{lab}</td><td class="num">{val}</td>'
+                 '<td><input type="number" step="any" class="chg" data-id="{id}" value="{v}" placeholder="0" '
+                 'aria-label="{aria}"></td><td class="pv" id="pv-{id}">{pv}</td></tr>'.format(
+                     id=n["id"], col=node_color(m, n["id"]), lab=esc(n["label"]), val=fnum(n["value"]),
+                     v="" if not v else fnum_plain(v), pv=preview_txt(n, v, unit),
+                     aria=esc(_("Änderung für {}").format(n["label"]))))
+    body.innerHTML = "".join(r)
+    apply_hover()
+
+
+def fnum_plain(v):
+    """Zahl für <input type=number> (Punkt als Dezimaltrenner, ohne überflüssige Nullen)."""
+    t = "{:.6f}".format(float(v)).rstrip("0").rstrip(".")
+    return t if t not in ("", "-0") else "0"
+
+
+def set_unit(unit):
+    """Wechselt die Einheit des Anstoßes und rechnet vorhandene Eingaben um, damit die Wirkung gleich bleibt."""
+    m = cur()
+    if not m:
+        return
+    read_sim_form()
+    d = m["draft"]
+    old = d.get("unit", "pct")
+    if unit == old:
+        return
+    conv = {}
+    for nid in d["changes"]:
+        n = node_by(m, nid)
+        if not n:
+            continue
+        v = float(d["changes"][nid])
+        val = float(n["value"])
+        if unit == "abs":
+            nv = val * v / 100.0
+        elif val:
+            nv = v / val * 100.0
+        else:
+            continue  # Wert 0: Prozentangabe nicht möglich
+        nv = round(nv * 1e6) / 1e6
+        if nv != 0:
+            conv[nid] = nv
+    dropped = len(d["changes"]) - len(conv)
+    d["changes"] = conv
+    d["unit"] = unit
+    save()
+    render_sim_form()
+    if dropped:
+        toast(_("{} Eingabe(n) bei Knoten mit Wert 0 entfernt – dort ist keine Prozentangabe möglich.").format(dropped), "warn")
+
+
+def read_sim_form():
+    m = cur()
+    if not m:
+        return
+    d = m["draft"]
+    d["model"] = "abs"
+    d["rounds"] = int(clamp(pfloat(el("sim-rounds").value, 12), 1, 200))
+    d["damping"] = clamp(pfloat(el("sim-damping").value, 1.0), 0.0, 1.0)
+    inputs = document.querySelectorAll("#changes-body input.chg")
+    ch = {}
+    for i in range(inputs.length):
+        inp = inputs.item(i)
+        v = pfloat(inp.value, None)
+        if v is not None and v != 0:
+            ch[attr(inp, "data-id")] = v if d.get("unit") == "abs" else max(-100.0, v)
+    d["changes"] = ch
+
+
+def change_summary(m, run):
+    parts = []
+    for nid in run["changes"]:
+        lab = run["labels"].get(nid) or (node_by(m, nid) or {}).get("label", "?")
+        v = float(run["changes"][nid])
+        parts.append("{} {}".format(esc(lab), fsigned(v) if run.get("unit") == "abs" else fpct(v)))
+    return ", ".join(parts) if parts else _("ohne Anstoß")
+
+
+def render_runs():
+    m = cur()
+    el("runs-count").textContent = str(len(m["sims"]) if m else 0)
+    ul = el("run-list")
+    el("runs-clear").hidden = not (m and m["sims"])
+    if not m or not m["sims"]:
+        ul.innerHTML = _('<li class="muted">Noch keine Läufe. Starte im Tab „Simulation“ einen Durchlauf.</li>')
+        el("run-detail").innerHTML = ""
+        return
+    r = []
+    for run in m["sims"]:
+        on = run["id"] == S["run"]
+        r.append(
+            _('<li class="run{on}"><button class="row-btn" data-action="run-open" data-id="{id}">'
+            '<span><b>{name}</b><small>{date} · {model}, {rounds} Runden</small><small>{sum}</small></span></button>'
+            '<div class="run-actions"><button class="small" data-action="run-rename" data-id="{id}">Umbenennen</button>'
+            '<button class="small" data-action="run-reuse" data-id="{id}">Als Vorlage</button>'
+            '<button class="small danger" data-action="run-delete" data-id="{id}">Löschen</button></div></li>').format(
+                on=" on" if on else "", id=run["id"], name=esc(run["name"]), date=fmt_date(run["created"]),
+                model={"log": _("multiplikativ (alt)"), "lin": _("linear (alt)")}.get(run["model"], _("absolut")), rounds=run["rounds"],
+                sum=change_summary(m, run)))
+    ul.innerHTML = "".join(r)
+    render_run_detail()
+
+
+def render_run_detail():
+    box = el("run-detail")
+    rs = run_state()
+    if not rs:
+        box.innerHTML = _('<p class="note">Wähle einen Lauf, um ihn auf der Karte abzuspielen.</p>')
+        return
+    run, now, prev, start, t = rs
+    m = cur()
+    changed = []
+    for k, nid in enumerate(run["nodes"]):
+        s0 = run["history"][0][k]
+        series = [row[k] - s0 for row in run["history"]]
+        if max([abs(x) for x in series]) > 1e-9 * max(1.0, abs(s0)):
+            changed.append((k, nid, series))
+    pct_mode = S["settings"].get("chartY") == "pct"
+    stable = ""
+    if run.get("stable"):
+        stable = _(" Ab Runde {} keine weitere Änderung.").format(run["stable"])
+    rows = []
+    for ci, (k, nid, series) in enumerate(changed):
+        col = node_color(m, nid, run)
+        lab = run["labels"].get(nid, "?")
+        rows.append('<tr data-hl="' + nid + '"><td><i class="sw" style="background:{}"></i>{}</td><td class="num">{}</td>'
+                    '<td class="num">{}</td><td class="num {}">{}<small>{}</small></td></tr>'.format(
+                        col, esc(lab), fnum(start[nid]), fnum(now[nid]),
+                        "pos" if series[t] > 0 else ("neg" if series[t] < 0 else ""), fsigned(series[t]),
+                        fpct(rel(now[nid], start[nid])) if start[nid] else ""))
+    unchanged = [run["labels"].get(nid, "?") for nid in run["nodes"]
+                 if nid not in [c[1] for c in changed]]
+    box.innerHTML = (
+        _('<div class="card"><div class="card-head"><h2>{name}</h2><span class="tag">Runde {t} / {n}</span></div>'
+        '<div class="row run-tools"><button class="small" data-action="export-run-csv">Als CSV exportieren</button></div>'
+        '<p class="note">{sum}. Dämpfung {damp}.{stable}</p>'
+        '<div class="chart-head"><span class="chart-title">{ytitle}</span>'
+        '<div class="seg chart-seg" role="group" aria-label="Y-Achse">'
+        '<button class="small" data-action="chart-y" data-v="abs" aria-pressed="{pa}">Absolut</button>'
+        '<button class="small" data-action="chart-y" data-v="pct" aria-pressed="{pp}">Änderung %</button></div></div>'
+        '<div class="chart">{chart}<p class="axis-note">{note}</p></div>'
+        '<table class="res"><thead><tr><th>Knoten</th><th>Start</th><th>Runde {t}</th><th>Δ</th></tr></thead>'
+        '<tbody>{rows}</tbody></table>{unch}</div>')).format(
+            name=esc(run["name"]), t=t, n=len(run["history"]) - 1, sum=change_summary(m, run),
+            damp=fnum(run["damping"]), stable=stable, chart=chart_svg(m, run, changed, t),
+            ytitle=_("Wert je Knoten") if not pct_mode else _("Änderung seit Runde 0"),
+            pa="false" if pct_mode else "true", pp="true" if pct_mode else "false",
+            note=chart_note(run, changed, pct_mode),
+            rows="".join(rows) or _('<tr><td colspan="4" class="muted">Keine Veränderung.</td></tr>'),
+            unch=(_('<p class="note">Unverändert: ') + esc(", ".join(unchanged)) + '</p>') if unchanged else "")
+    apply_hover()
+    tp = S.get("tip")
+    if tp and tp[0] == S.get("hover"):
+        chart_tip(tp[0], min(tp[1], CHART.get("n", 0)))
+
+
+def chart_note(run, changed, pct_mode):
+    base = _("x-Achse: Runde · Linie berühren für Werte")
+    if not pct_mode:
+        return base
+    zero = [run["labels"].get(nid, "?") for (k, nid, d) in changed if abs(run["history"][0][k]) < 1e-12]
+    if zero:
+        return esc(_("Ohne Linie (Startwert 0, kein % möglich): ") + ", ".join(zero)) + " · " + base
+    return base
+
+
+def a_chart_y(b, e):
+    S["settings"]["chartY"] = "pct" if attr(b, "data-v") == "pct" else "abs"
+    save()
+    render_run_detail()
+
+
+def nice_step(raw):
+    if raw <= 0:
+        return 1.0
+    e = math.floor(log10(raw))
+    b = raw / (10 ** e)
+    m = 1 if b <= 1 else (2 if b <= 2 else (5 if b <= 5 else 10))
+    return m * (10 ** e)
+
+
+def tick_lbl(y, step, signed=True):
+    if abs(y) < step * 0.01:
+        return "0"
+    dec = 0 if step >= 1 else (1 if step >= 0.1 else (2 if step >= 0.01 else 3))
+    a = abs(y)
+    if a >= 1e6:
+        t = "{:.1e}".format(a)
+    else:
+        t = ("{:." + str(dec) + "f}").format(a)
+    if not signed:
+        return ("−" if y < 0 else "") + t.replace(".", dec_sep())
+    return ("+" if y > 0 else "−") + t.replace(".", dec_sep())
+
+
+def chart_width():
+    """Breite des Diagramms in Pixeln = verfügbare Breite in der Seitenleiste (Schrift bleibt so gleich groß)."""
+    w = float(el("run-detail").clientWidth)
+    return int(w - 26) if w > 100 else 380
+
+
+CHART = {}  # Geometrie und Datenreihen des zuletzt gezeichneten Diagramms (für die Hover-Anzeige)
+
+
+def chart_svg(m, run, changed, t):
+    """Liniendiagramm der absoluten Werte je Knoten über alle Runden; t = markierte Runde.
+    changed = [(Spalte, Knoten-ID, Änderungsreihe)]; gezeichnet wird Startwert + Änderung."""
+    W = float(chart_width())
+    H = float(int(clamp(W * 0.6, 230, 380)))
+    pl, pr, pt, pb = 52.0, 14.0, 14.0, 30.0
+    n = len(run["history"]) - 1
+    pct_mode = S["settings"].get("chartY") == "pct"
+    series = []
+    vals = []
+    for (k, nid, d) in changed:
+        s0 = run["history"][0][k]
+        ab = [s0 + x for x in d]
+        if pct_mode:
+            if abs(s0) < 1e-12:
+                continue  # Startwert 0: keine Prozentangabe möglich
+            yv = [x / abs(s0) * 100.0 for x in d]
+        else:
+            yv = ab
+        series.append((nid, yv, ab, s0))
+        vals.extend(yv)
+    if pct_mode:
+        vals.append(0.0)  # Nulllinie immer sichtbar
+    if not vals:
+        vals = [0.0]
+    lo, hi = min(vals), max(vals)
+    if hi - lo < 1e-9 * max(1.0, abs(hi)):
+        pad = max(1.0, abs(hi) * 0.1)
+        hi += pad
+        lo -= pad
+    step = nice_step((hi - lo) / 4.0)
+    lo = math.floor(lo / step) * step
+    hi = math.ceil(hi / step) * step
+
+    def ylbl(y):
+        return (tick_lbl(y, step, True) + pct_sign()) if pct_mode else tick_lbl(y, step, False)
+    pl = max(pl, 10.0 + 6.2 * max(len(ylbl(lo)), len(ylbl(hi))))  # Platz für lange Achsenbeschriftungen
+
+    def X(i):
+        return pl + (W - pl - pr) * (i / float(max(1, n)))
+
+    def Y(v):
+        return pt + (H - pt - pb) * (1 - (v - lo) / (hi - lo))
+    CHART.clear()
+    CHART.update({"W": W, "H": H, "pl": pl, "pr": pr, "n": n, "X": X, "Y": Y, "series": {}})
+    o = ['<svg viewBox="0 0 {:.0f} {:.0f}" role="img" aria-label="{}">'.format(
+        W, H, _("Prozentuale Änderung je Knoten") if pct_mode else _("Verlauf der Werte je Knoten"))]
+    y = lo
+    while y <= hi + step * 0.01:
+        o.append('<line class="grid{}" x1="{:.1f}" x2="{:.1f}" y1="{:.1f}" y2="{:.1f}"/>'.format(
+            " zero" if abs(y) < step * 0.01 else "", pl, W - pr, Y(y), Y(y)))
+        o.append('<text class="ax" x="{:.1f}" y="{:.1f}" text-anchor="end">{}</text>'.format(
+            pl - 6, Y(y) + 4, ylbl(y)))
+        y += step
+    xs = max(1, int(math.ceil(n / max(4.0, (W - pl - pr) / 40.0))))
+    for i in range(0, n + 1, xs):
+        o.append('<text class="ax" x="{:.1f}" y="{:.1f}" text-anchor="middle">{}</text>'.format(X(i), H - 10, i))
+    o.append('<line class="cursor" x1="{0:.1f}" x2="{0:.1f}" y1="{1:.1f}" y2="{2:.1f}"/>'.format(X(t), pt, H - pb))
+    for (nid, yv, ab, s0) in series:
+        col = node_color(m, nid, run)
+        CHART["series"][nid] = (run["labels"].get(nid, "?"), yv, s0, col, ab)
+        pts = " ".join(["{:.1f},{:.1f}".format(X(i), Y(v)) for i, v in enumerate(yv)])
+        o.append('<g class="series" data-hl="{}">'
+                 '<polyline points="{}" class="shit"/>'
+                 '<polyline points="{}" class="sline" fill="none" stroke="{}" stroke-width="2.2" stroke-linejoin="round"/>'
+                 '<circle cx="{:.1f}" cy="{:.1f}" r="4" fill="{}" class="dotc"/></g>'.format(
+                     nid, pts, pts, col, X(t), Y(yv[t]), col))
+    o.append('<circle id="chart-mark" class="mark" r="5" cx="0" cy="0" visibility="hidden"/>')
+    o.append('</svg><div id="chart-tip" class="chart-tip" hidden></div>')
+    return "".join(o)
+
+
+def chart_tip(nid, i):
+    """Zeigt im Diagramm Knotenname, Runde, Wert und Änderung an Position i der Reihe nid (None = ausblenden)."""
+    tip = el("chart-tip")
+    mark = el("chart-mark")
+    if is_none(tip) or is_none(mark):
+        return
+    sr = CHART.get("series", {}).get(nid) if nid else None
+    if sr is None or i is None:
+        tip.hidden = True
+        mark.setAttribute("visibility", "hidden")
+        S["tip"] = None
+        return
+    S["tip"] = (nid, i)
+    lab, yv, s0, col, ab = sr
+    v = ab[i]
+    x, y = CHART["X"](i), CHART["Y"](yv[i])
+    mark.setAttribute("cx", "{:.1f}".format(x))
+    mark.setAttribute("cy", "{:.1f}".format(y))
+    mark.setAttribute("fill", col)
+    mark.setAttribute("visibility", "visible")
+    d = v - s0
+    cls = "pos" if d > 0 else ("neg" if d < 0 else "")
+    if S["settings"].get("chartY") == "pct":
+        tip.innerHTML = (_('<b><i class="sw" style="background:{}"></i>{}</b>'
+                         '<span>Runde {}: <strong class="{}">{}</strong> <em>({}, {})</em></span>')).format(
+            col, esc(lab), i, cls, fpct(yv[i]) if abs(d) > 1e-12 else "±0" + pct_sign(), fnum(v),
+            fsigned(d) if abs(d) > 1e-12 else "±0")
+    else:
+        tip.innerHTML = (_('<b><i class="sw" style="background:{}"></i>{}</b>'
+                         '<span>Runde {}: <strong>{}</strong> <em class="{}">{}</em></span>')).format(
+            col, esc(lab), i, fnum(v), cls,
+            "(" + fsigned(d) + ")" if abs(d) > 1e-12 else "(±0)")
+    fx = x / CHART["W"]
+    tip.style.left = "{:.2f}%".format(fx * 100)
+    tip.style.top = "{:.2f}%".format(y / CHART["H"] * 100)
+    if S.get("touch"):
+        cls = " touch" + (" left" if fx > 0.7 else (" right" if fx < 0.3 else "")) + (" side" if y / CHART["H"] < 0.35 else "")
+    else:
+        cls = (" left" if fx > 0.6 else "") + (" below" if y / CHART["H"] < 0.3 else "")
+    tip.className = "chart-tip" + cls
+    tip.hidden = False
+
+
+def chart_touch(e):
+    S["touch"] = True
+    _chart_touch(e)
+
+
+def _chart_touch(e):
+    """Touch: wählt die Linie, die dem Finger in der getroffenen Runde am nächsten liegt, und zeigt deren Wert."""
+    svg = closest(e.target, ".chart svg")
+    if is_none(svg) or not CHART or not CHART["series"]:
+        return
+    r = svg.getBoundingClientRect()
+    if not r.width:
+        return
+    vx = (e.clientX - r.left) / r.width * CHART["W"]
+    vy = (e.clientY - r.top) / r.height * CHART["H"]
+    f = (vx - CHART["pl"]) / (CHART["W"] - CHART["pl"] - CHART["pr"])
+    i = int(round(clamp(f, 0.0, 1.0) * CHART["n"]))
+    best, bd = None, 1e18
+    for nid in CHART["series"]:
+        d = abs(CHART["Y"](CHART["series"][nid][1][i]) - vy)
+        if d < bd:
+            best, bd = nid, d
+    if bd > 60:  # weit weg von jeder Linie
+        set_hover(None)
+        chart_tip(None, None)
+        return
+    set_hover(best)
+    chart_tip(best, i)
+
+
+def on_chart_down(e):
+    if str(e.pointerType) == "touch":
+        if is_none(closest(e.target, ".chart svg")):
+            chart_tip(None, None)
+        else:
+            chart_touch(e)
+
+
+def on_chart_move(e):
+    if str(e.pointerType) == "touch":
+        chart_touch(e)
+        return
+    S["touch"] = False
+    svg = closest(e.target, ".chart svg")
+    if is_none(svg) or not CHART:
+        chart_tip(None, None)
+        return
+    nid = S.get("hover")
+    if nid not in CHART["series"]:
+        chart_tip(None, None)
+        return
+    r = svg.getBoundingClientRect()
+    if not r.width:
+        return
+    vx = (e.clientX - r.left) / r.width * CHART["W"]
+    n = CHART["n"]
+    f = (vx - CHART["pl"]) / (CHART["W"] - CHART["pl"] - CHART["pr"])
+    i = int(round(clamp(f, 0.0, 1.0) * n))
+    chart_tip(nid, i)
+
+
+def on_chart_leave(e):
+    if str(e.pointerType) == "touch":
+        return  # nach dem Loslassen stehen lassen; Antippen außerhalb blendet aus
+    chart_tip(None, None)
+
+
+def render_playback():
+    pb = el("playback")
+    rs = run_state()
+    if not rs:
+        pb.hidden = True
+        return
+    run, now, prev, start, t = rs
+    pb.hidden = False
+    rng = el("pb-range")
+    rng.max = str(len(run["history"]) - 1)
+    rng.value = str(t)
+    el("pb-label").textContent = _("Runde {} / {}").format(t, len(run["history"]) - 1)
+    el("pb-play").textContent = _("Pause") if S["timer"] is not None else _("Abspielen")
+
+
+def render_size_toggle():
+    b = el("size-toggle")
+    on = bool(S["settings"].get("sizeByValue"))
+    b.setAttribute("aria-pressed", "true" if on else "false")
+    b.title = (_("Knotengröße hängt vom Wert ab – klicken zum Ausschalten (G)") if on
+               else _("Alle Knoten gleich groß – klicken, damit die Größe vom Wert abhängt (G)"))
+
+
+def toggle_size():
+    S["settings"]["sizeByValue"] = not S["settings"].get("sizeByValue")
+    save()
+    render_size_toggle()
+    render_canvas()
+
+
+FULL = {"on": False, "native": False}
+
+
+def fs_element():
+    f = document.fullscreenElement
+    if is_none(f):
+        try:
+            f = document.webkitFullscreenElement
+        except Exception:
+            f = None
+    return None if is_none(f) else f
+
+
+def _fs_denied(*args):
+    """Browser lehnt Vollbild ab (z. B. eingebettete Ansicht ohne Erlaubnis): Hinweis, CSS-Ansicht bleibt."""
+    if FULL["on"] and fs_element() is None:
+        toast(_("Der Browser erlaubt hier kein Vollbild – die Karte füllt das Fenster."))
+    return None
+
+
+IGNORE = create_proxy(_fs_denied)
+
+
+def is_ios():
+    """iPhone/iPad: Safari beendet das Element-Vollbild schon beim Streichen nach unten, was beim Verschieben der
+    Karte stört – dort nur die CSS-Ansicht (als Home-Bildschirm-App ohnehin ohne Browserleisten)."""
+    nav = window.navigator
+    ua = str(nav.userAgent)
+    try:
+        tp = int(nav.maxTouchPoints or 0)
+    except Exception:
+        tp = 0
+    return ("iPhone" in ua or "iPad" in ua or "iPod" in ua) or ("Macintosh" in ua and tp > 1)
+
+
+def set_fullmap(on):
+    """Bildschirmfüllende Kartenansicht: blendet Kopf- und Seitenleiste per CSS aus und versucht zusätzlich den
+    Vollbildmodus des Browsers. Ist dieser nicht verfügbar (z. B. iPhone, eingebettete Vorschau), bleibt es beim
+    Ausblenden – die Karte füllt dann das Browserfenster."""
+    on = bool(on)
+    FULL["on"] = on
+    document.body.classList.toggle("fullmap", on)
+    b = el("full-toggle")
+    if not is_none(b):
+        b.setAttribute("aria-pressed", "true" if on else "false")
+    de = document.documentElement
+    try:
+        p = None
+        if on and fs_element() is None and not is_ios():
+            if not is_none(de.requestFullscreen):
+                p = de.requestFullscreen()
+            elif not is_none(de.webkitRequestFullscreen):
+                de.webkitRequestFullscreen()
+        elif not on and fs_element() is not None:
+            if not is_none(document.exitFullscreen):
+                p = document.exitFullscreen()
+            elif not is_none(document.webkitExitFullscreen):
+                document.webkitExitFullscreen()
+        if p is not None and not is_none(p):
+            p.catch(IGNORE)  # abgelehnt (z. B. in eingebetteter Ansicht): Hinweis, CSS-Ansicht genügt
+    except Exception:
+        pass
+    if not on:
+        FULL["native"] = False
+
+
+def on_fs_change(*args):
+    """Browser-Vollbild betreten/verlassen (auch per Esc oder Systemgeste): Ansicht nachziehen."""
+    if fs_element() is not None:
+        FULL["native"] = True
+    elif FULL["native"] and FULL["on"]:
+        set_fullmap(False)
+
+
+def render_modes():
+    btns = document.querySelectorAll("#modes button")
+    for i in range(btns.length):
+        b = btns.item(i)
+        b.setAttribute("aria-pressed", "true" if attr(b, "data-mode") == S["mode"] else "false")
+    el("canvas").setAttribute("data-mode", S["mode"])
+
+
+def set_tab(tab):
+    S["tab"] = tab
+    for t in ["edit", "sim", "runs"]:
+        el("tab-" + t).hidden = t != tab
+    tabs = document.querySelectorAll(".tabs button")
+    for i in range(tabs.length):
+        b = tabs.item(i)
+        b.setAttribute("aria-selected", "true" if attr(b, "data-tab") == tab else "false")
+    if tab == "sim":
+        render_sim_form()
+    if tab == "runs":
+        render_runs()
+
+
+def render_all():
+    render_size_toggle()
+    render_maps()
+    render_modes()
+    render_canvas()
+    render_inspector()
+    render_node_list()
+    render_sim_form()
+    render_runs()
+    render_playback()
+
+
+def render_edit():
+    render_canvas()
+    render_inspector()
+    render_node_list()
+
+
+# ---------------------------------------------------------------- Simulation abspielen
+def open_run(rid, rnd=None):
+    stop()
+    S["run"] = rid
+    m = cur()
+    run = run_by(m, rid)
+    S["round"] = 0 if rnd is None else rnd
+    if run and rnd is None:
+        S["round"] = len(run["history"]) - 1
+    S["sel"] = None
+    render_canvas()
+    render_runs()
+    render_playback()
+
+
+def close_run():
+    stop()
+    S["run"] = None
+    render_canvas()
+    render_runs()
+    render_playback()
+
+
+def set_round(r):
+    rs = run_state()
+    if not rs:
+        return
+    S["round"] = int(clamp(r, 0, len(rs[0]["history"]) - 1))
+    render_canvas()
+    render_run_detail()
+    render_playback()
+
+
+def tick(*args):
+    rs = run_state()
+    if not rs:
+        stop()
+        return
+    if S["round"] >= len(rs[0]["history"]) - 1:
+        stop()
+        render_playback()
+        return
+    set_round(S["round"] + 1)
+
+
+TICK = create_proxy(tick)
+
+
+def play():
+    rs = run_state()
+    if not rs:
+        return
+    if S["timer"] is not None:
+        stop()
+        render_playback()
+        return
+    if S["round"] >= len(rs[0]["history"]) - 1:
+        S["round"] = 0
+        render_canvas()
+    S["timer"] = window.setInterval(TICK, 650)
+    render_playback()
+
+
+def stop():
+    if S["timer"] is not None:
+        window.clearInterval(S["timer"])
+        S["timer"] = None
+
+
+# ---------------------------------------------------------------- Bearbeiten
+def add_node(x, y):
+    m = cur()
+    n = {"id": uid("n"), "label": _("Knoten {}").format(len(m["nodes"]) + 1), "value": 100,
+         "x": round(x), "y": round(y), "c": free_color(m)}
+    m["nodes"].append(n)
+    S["sel"] = {"type": "node", "id": n["id"]}
+    save()
+    render_edit()
+    render_sim_form()
+    set_tab("edit")
+    start_inline_edit(n["id"])
+
+
+# ---------------------------------------------------------------- Text direkt auf der Karte bearbeiten
+# Ein <input> über dem Knoten. Start: Doppelklick/Doppeltippen, Enter oder F2 beim ausgewählten Knoten,
+# automatisch bei neuen Knoten. Enter oder Klick daneben übernimmt, Esc verwirft.
+EDIT = {"id": None, "orig": "", "t": 0.0}
+
+
+def start_inline_edit(nid):
+    m = cur()
+    n = node_by(m, nid) if m else None
+    if not n:
+        return
+    leave_sim_view()
+    inp = el("node-edit")
+    if EDIT["id"] == nid and not inp.hidden:
+        return
+    EDIT["id"] = nid
+    EDIT["orig"] = n["label"]
+    S["sel"] = {"type": "node", "id": nid}
+    inp.value = n["label"]
+    inp.hidden = False
+    render_canvas()  # setzt auch die Position
+    EDIT["t"] = float(window.Date.now())
+    # Sofort fokussieren (iOS öffnet die Tastatur nur innerhalb der Tipp-Geste) und kurz danach noch einmal,
+    # falls das Standardverhalten von mousedown den Fokus wieder weggenommen hat.
+    _focus_edit()
+    window.setTimeout(FOCUS_EDIT, 30)
+
+
+def _focus_edit(*args):
+    inp = el("node-edit")
+    if EDIT["id"] and not inp.hidden:
+        inp.focus()
+        inp.select()
+
+
+FOCUS_EDIT = create_proxy(_focus_edit)
+
+
+def position_inline_edit():
+    """Legt das Eingabefeld passgenau über die Textzeile des bearbeiteten Knotens (folgt Zoom und Verschieben)."""
+    inp = el("node-edit")
+    if is_none(inp) or not EDIT["id"]:
+        return
+    m = cur()
+    n = node_by(m, EDIT["id"]) if m else None
+    if not n:
+        end_inline_edit(False)
+        return
+    r = stage_rect()
+    v = S["view"]
+    k = float(r.width) / v["w"]  # Pixel pro Welteinheit
+    w, h = node_size(n)
+    f = node_scales(m, None).get(n["id"], 1.0)
+    px = (float(n["x"]) - v["x"]) * k
+    py = (float(n["y"]) - 6 * f - v["y"]) * k
+    inp.style.left = "{:.1f}px".format(px)
+    inp.style.top = "{:.1f}px".format(py)
+    inp.style.width = "{:.0f}px".format(max(140.0, (w * f + 30) * k))
+    inp.style.fontSize = "{:.1f}px".format(clamp(13.5 * f * k, 12.0, 26.0))
+
+
+def end_inline_edit(commit=True):
+    nid = EDIT["id"]
+    if not nid:
+        return
+    inp = el("node-edit")
+    EDIT["id"] = None
+    inp.hidden = True
+    m = cur()
+    n = node_by(m, nid) if m else None
+    if n:
+        if commit:
+            n["label"] = str(inp.value).strip() or EDIT["orig"]
+        else:
+            n["label"] = EDIT["orig"]
+        save()
+    render_canvas()
+    render_node_list()
+    render_sim_form()
+    f = el("f-node-label")
+    if n and not is_none(f) and S["sel"] and S["sel"].get("id") == nid:
+        f.value = n["label"]
+
+
+def on_edit_key(e):
+    k = str(e.key)
+    if k == "Enter":
+        e.preventDefault()
+        end_inline_edit(True)
+    elif k == "Escape":
+        e.preventDefault()
+        end_inline_edit(False)
+    e.stopPropagation()
+
+
+def on_edit_blur(e):
+    if EDIT["id"] and float(window.Date.now()) - EDIT["t"] < 400:
+        window.setTimeout(FOCUS_EDIT, 0)  # Fokusverlust direkt nach dem Öffnen ignorieren
+        return
+    end_inline_edit(True)
+
+
+def add_edge(a, b):
+    m = cur()
+    if not a or not b:
+        return
+    for e in m["edges"]:
+        if e["src"] == a and e["dst"] == b:
+            S["sel"] = {"type": "edge", "id": e["id"]}
+            render_edit()
+            return
+    e = {"id": uid("e"), "src": a, "dst": b, "w": 0.5}
+    m["edges"].append(e)
+    S["sel"] = {"type": "edge", "id": e["id"]}
+    save()
+    set_tab("edit")
+    render_edit()
+
+
+def delete_sel():
+    m = cur()
+    sel = S["sel"]
+    if not m or not sel:
+        return
+    if sel["type"] == "node":
+        m["nodes"] = [n for n in m["nodes"] if n["id"] != sel["id"]]
+        m["edges"] = [e for e in m["edges"] if e["src"] != sel["id"] and e["dst"] != sel["id"]]
+        if sel["id"] in m["draft"]["changes"]:
+            m["draft"]["changes"].pop(sel["id"])
+    else:
+        m["edges"] = [e for e in m["edges"] if e["id"] != sel["id"]]
+    S["sel"] = None
+    save()
+    render_edit()
+    render_sim_form()
+
+
+def set_mode(mode):
+    S["mode"] = mode
+    S["pending"] = None
+    render_modes()
+    render_canvas()
+
+
+def leave_sim_view():
+    if S["run"]:
+        close_run()
+
+
+# ---------------------------------------------------------------- Zeiger-Ereignisse
+PTRS = {}
+
+
+def pinch_dist():
+    ps = list(PTRS.values())
+    dx = ps[0][0] - ps[1][0]
+    dy = ps[0][1] - ps[1][1]
+    return max(1.0, math.sqrt(dx * dx + dy * dy)), (ps[0][0] + ps[1][0]) / 2, (ps[0][1] + ps[1][1]) / 2
+
+
+def on_down(e):
+    if e.button is not None and int(e.button) != 0:
+        return
+    m = cur()
+    if not m:
+        return
+    PTRS[str(e.pointerId)] = (float(e.clientX), float(e.clientY))
+    if len(PTRS) == 2:
+        d, cx, cy = pinch_dist()
+        r = stage_rect()
+        v = S["view"]
+        S["temp"] = None
+        S["drag"] = {"type": "pinch", "d0": d, "w0": v["w"], "h0": v["h"],
+                     "wx": v["x"] + (cx - float(r.left)) / float(r.width) * v["w"],
+                     "wy": v["y"] + (cy - float(r.top)) / float(r.height) * v["h"],
+                     "fx": (cx - float(r.left)) / float(r.width), "fy": (cy - float(r.top)) / float(r.height)}
+        try:
+            el("canvas").setPointerCapture(e.pointerId)
+        except Exception:
+            pass
+        return
+    if len(PTRS) > 2:
+        return
+    x, y = to_world(e)
+    nid = attr(closest(e.target, "[data-node]"), "data-node")
+    eid = attr(closest(e.target, "[data-edge]"), "data-edge")
+    svg = el("canvas")
+    try:
+        svg.setPointerCapture(e.pointerId)
+    except Exception:
+        pass
+    mode = S["mode"]
+    if mode == "node" and not nid and not eid:
+        leave_sim_view()
+        add_node(x, y)
+        return
+    if mode == "edge" and nid:
+        leave_sim_view()
+        if S["pending"]:  # zweiter Tipp: Kante zum angetippten Knoten, auf denselben Knoten = Schleife
+            a = S["pending"]
+            S["pending"] = None
+            add_edge(a, nid)
+            return
+        n = node_by(m, nid)
+        S["drag"] = {"type": "link", "src": nid, "moved": False}
+        S["temp"] = [n["x"], n["y"], x, y]
+        render_canvas()
+        return
+    if nid:
+        n = node_by(m, nid)
+        S["sel"] = {"type": "node", "id": nid}
+        S["drag"] = {"type": "node", "id": nid, "ox": x - n["x"], "oy": y - n["y"], "moved": False}
+        if not S["run"]:
+            set_tab("edit")
+        render_edit()
+    elif eid:
+        S["sel"] = {"type": "edge", "id": eid}
+        S["drag"] = None
+        if not S["run"]:
+            set_tab("edit")
+        render_edit()
+    else:
+        if S["sel"]:
+            S["sel"] = None
+            render_edit()
+        v = S["view"]
+        S["pending"] = None
+        S["drag"] = {"type": "pan", "sx": float(e.clientX), "sy": float(e.clientY),
+                     "vx": v["x"], "vy": v["y"]}
+
+
+def on_move(e):
+    k = str(e.pointerId)
+    if k in PTRS:
+        PTRS[k] = (float(e.clientX), float(e.clientY))
+    d = S["drag"]
+    if not d:
+        return
+    m = cur()
+    if d["type"] == "pinch":
+        if len(PTRS) < 2:
+            return
+        dist, cx, cy = pinch_dist()
+        v = S["view"]
+        nw = clamp(d["w0"] * d["d0"] / dist, 200.0, 8000.0)
+        f = nw / d["w0"]
+        v["w"], v["h"] = nw, d["h0"] * f
+        v["x"] = d["wx"] - d["fx"] * v["w"]
+        v["y"] = d["wy"] - d["fy"] * v["h"]
+        render_canvas()
+    elif d["type"] == "node":
+        x, y = to_world(e)
+        n = node_by(m, d["id"])
+        if n:
+            n["x"] = round(x - d["ox"])
+            n["y"] = round(y - d["oy"])
+            d["moved"] = True
+            render_canvas()
+    elif d["type"] == "link":
+        x, y = to_world(e)
+        S["temp"][2], S["temp"][3] = x, y
+        d["moved"] = True
+        n = node_by(cur(), d["src"])
+        if n:
+            w, h = node_size(n)
+            if abs(x - n["x"]) > w / 2 + 6 or abs(y - n["y"]) > h / 2 + 6:
+                d["left"] = True  # Zeiger hat den Startknoten verlassen
+        render_canvas()
+    elif d["type"] == "pan":
+        r = stage_rect()
+        v = S["view"]
+        s = v["w"] / max(1.0, float(r.width))
+        v["x"] = d["vx"] - (float(e.clientX) - d["sx"]) * s
+        v["y"] = d["vy"] - (float(e.clientY) - d["sy"]) * s
+        render_canvas()
+
+
+def on_up(e):
+    k = str(e.pointerId)
+    if k in PTRS:
+        PTRS.pop(k)
+    d = S["drag"]
+    if d and d["type"] == "pinch":
+        if not PTRS:
+            S["drag"] = None
+        return
+    S["drag"] = None
+    if str(e.pointerType) == "touch" and not (d and d.get("moved")):
+        # Touch: Antippen setzt die Hover-Anzeige selbst – pointerover kommt auf dem iPad vor dem Ziehen-Beginn
+        # bzw. gar nicht, und während des Ziehens war die Anzeige ausgeblendet.
+        hit = document.elementFromPoint(e.clientX, e.clientY)
+        S["ehover"] = attr(closest(hit, "[data-edge]"), "data-edge")
+        S["hover"] = attr(closest(hit, "[data-hl]"), "data-hl")
+        apply_hover()
+    elif d and d["type"] == "node":
+        apply_hover()  # Anzeige nach dem Ziehen wieder einblenden
+    if not d:
+        return
+    # Doppelklick/Doppeltippen auf einen Knoten selbst erkennen: Weil die Karte beim ersten Klick neu gezeichnet
+    # wird, meldet der Browser kein zuverlässiges dblclick auf dem Knoten.
+    if d["type"] == "node" and not d["moved"]:
+        now = float(window.Date.now())
+        last = S.get("tap") or (None, 0.0)
+        if last[0] == d["id"] and now - last[1] < 400:
+            S["tap"] = None
+            start_inline_edit(d["id"])
+            return
+        S["tap"] = (d["id"], now)
+    if d["type"] == "node" and d["moved"]:
+        save()
+    elif d["type"] == "link":
+        S["temp"] = None
+        hit = document.elementFromPoint(e.clientX, e.clientY)
+        tgt = attr(closest(hit, "[data-node]"), "data-node")
+        if tgt and (tgt != d["src"] or d.get("left")):  # hinaus und zurück auf denselben Knoten = Schleife
+            add_edge(d["src"], tgt)
+        else:
+            S["pending"] = d["src"]
+            render_canvas()
+
+
+def on_dbl(e):
+    if S["mode"] != "select":
+        return
+    hit = document.elementFromPoint(e.clientX, e.clientY)
+    nid = attr(closest(hit, "[data-node]"), "data-node")
+    if nid:
+        start_inline_edit(nid)
+        return
+    if closest(hit, "[data-edge]") or not is_none(closest(hit, "#node-edit")):
+        return
+    leave_sim_view()
+    x, y = to_world(e)
+    add_node(x, y)
+
+
+def on_wheel(e):
+    e.preventDefault()
+    x, y = to_world(e)
+    zoom(1.0015 ** float(e.deltaY), x, y)
+
+
+# ---------------------------------------------------------------- Aktionen
+def a_mode(b, e):
+    leave_sim_view() if attr(b, "data-mode") != "select" else None
+    set_mode(attr(b, "data-mode"))
+
+
+def a_tab(b, e):
+    t = attr(b, "data-tab")
+    if t == "edit":
+        leave_sim_view()
+    set_tab(t)
+
+
+def a_map_new(b, e):
+    name = window.prompt(_("Name der neuen Karte:"), _("Neue Karte"))
+    if is_none(name):
+        return
+    m = new_map(str(name).strip() or _("Neue Karte"))
+    S["maps"].append(m)
+    switch_map(m["id"])
+
+
+def a_map_rename(b, e):
+    m = cur()
+    name = window.prompt(_("Neuer Name:"), m["name"])
+    if is_none(name) or not str(name).strip():
+        return
+    m["name"] = str(name).strip()
+    save()
+    render_maps()
+
+
+def a_map_dup(b, e):
+    m = cur()
+    c = json.loads(json.dumps(m))
+    c["id"] = uid("m")
+    c["name"] = m["name"] + _(" (Kopie)")
+    c["created"] = now_iso()
+    S["maps"].append(c)
+    switch_map(c["id"])
+
+
+def a_map_sample(b, e):
+    """Legt die Beispielkarte in der aktuellen Sprache als neue Karte an (vorhandene Karten bleiben unverändert)."""
+    m = sample_map()
+    names = [x["name"] for x in S["maps"]]
+    name, k = m["name"], 2
+    while name in names:
+        name = "{} {}".format(m["name"], k)
+        k += 1
+    m["name"] = name
+    S["maps"].append(m)
+    switch_map(m["id"])
+    toast(_("Beispielkarte „{}“ hinzugefügt").format(name))
+
+
+UNDO_MAP = {"map": None, "idx": 0, "filler": None}
+
+
+def a_map_delete(b, e):
+    """Löscht die aktuelle Karte ohne Rückfrage (Browser-Dialoge sind z. B. in eingebetteten Ansichten gesperrt);
+    „Rückgängig“ in der Meldung stellt sie an alter Stelle wieder her."""
+    m = cur()
+    if not m:
+        return
+    idx = 0
+    for k, x in enumerate(S["maps"]):
+        if x["id"] == m["id"]:
+            idx = k
+    S["maps"] = [x for x in S["maps"] if x["id"] != m["id"]]
+    UNDO_MAP["map"] = m
+    UNDO_MAP["idx"] = idx
+    UNDO_MAP["filler"] = None
+    if not S["maps"]:
+        f = new_map(_("Neue Karte"))
+        UNDO_MAP["filler"] = f["id"]
+        S["maps"].append(f)
+    switch_map(S["maps"][min(idx, len(S["maps"]) - 1)]["id"])
+    toast(_("Karte „{}“ gelöscht.").format(m["name"]), "ok", "map-undo", _("Rückgängig"))
+
+
+def a_map_undo(b, e):
+    m = UNDO_MAP["map"]
+    if m is None:
+        return
+    f = UNDO_MAP["filler"]
+    if f:
+        S["maps"] = [x for x in S["maps"] if not (x["id"] == f and not x["nodes"] and not x["sims"])]
+    S["maps"].insert(min(UNDO_MAP["idx"], len(S["maps"])), m)
+    UNDO_MAP["map"] = None
+    UNDO_MAP["filler"] = None
+    switch_map(m["id"])
+    toast(_("Karte „{}“ wiederhergestellt.").format(m["name"]))
+
+
+# ---------------------------------------------------------------- Export / Import
+EXPORT_FORMAT = "fuzzymap-fcm"
+TOAST = {"t": None}
+
+
+def hide_toast(*args):
+    el("toast").classList.remove("show")
+    TOAST["t"] = None
+
+
+HIDE_TOAST = create_proxy(hide_toast)
+
+
+def toast(msg, kind="ok", action=None, label=""):
+    """Kurze Meldung; optional mit Knopf (data-action=action), dann länger sichtbar."""
+    t = el("toast")
+    t.textContent = msg
+    if action:
+        bt = document.createElement("button")
+        bt.className = "toast-btn"
+        bt.setAttribute("data-action", action)
+        bt.textContent = label
+        t.appendChild(bt)
+    t.className = "toast show " + kind + (" has-btn" if action else "")
+    if TOAST["t"] is not None:
+        window.clearTimeout(TOAST["t"])
+    TOAST["t"] = window.setTimeout(HIDE_TOAST, 8000 if action else 4200)
+
+
+def safe_name(name, fallback):
+    r = "".join([c if c.isalpha() or c.isdigit() else "-" for c in name])
+    while "--" in r:
+        r = r.replace("--", "-")
+    return r.strip("-") or fallback
+
+
+def today():
+    return now_iso()[:10]
+
+
+def download(txt, filename, mime):
+    blob = window.Blob.new(to_js([txt]), to_js({"type": mime}))
+    url = window.URL.createObjectURL(blob)
+    a = document.createElement("a")
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+
+
+def export_json(maps):
+    return window.JSON.stringify(window.JSON.parse(json.dumps(
+        {"format": EXPORT_FORMAT, "version": 2, "exported": now_iso(), "maps": maps})), None, 2)
+
+
+def a_export_map(b, e):
+    m = cur()
+    download(export_json([m]), safe_name(m["name"], "karte") + ".fuzzymap.json", "application/json")
+    toast(_("Karte „{}“ exportiert.").format(m["name"]))
+
+
+def a_export_all(b, e):
+    download(export_json(S["maps"]), "fuzzymap-backup-{}.json".format(today()), "application/json")
+    toast(_("{} Karten als Sicherung exportiert.").format(len(S["maps"])))
+
+
+def csv_sep():
+    return "," if is_en() else ";"  # Englisch: Komma/Punkt, Deutsch: Semikolon/Komma (wie Excel je Sprache)
+
+
+def csv_num(v):
+    return ("{:.6f}".format(float(v)).rstrip("0").rstrip(".") or "0").replace(".", dec_sep())
+
+
+def csv_cell(t):
+    t = str(t)
+    if csv_sep() in t or '"' in t or "\n" in t:
+        t = '"' + t.replace('"', '""') + '"'
+    return t
+
+
+def a_export_run_csv(b, e):
+    m = cur()
+    run = run_by(m, S["run"]) if S["run"] else None
+    if not run and m and m["sims"]:
+        run = m["sims"][0]
+    if not run:
+        toast(_("Diese Karte hat noch keinen gespeicherten Lauf."), "warn")
+        return
+    labels = [run["labels"].get(nid, nid) for nid in run["nodes"]]
+    lines = [csv_sep().join([_("Runde")] + [csv_cell(l) for l in labels])]
+    for t, row in enumerate(run["history"]):
+        lines.append(csv_sep().join([str(t)] + [csv_num(v) for v in row]))
+    lines.append("")
+    lines.append(csv_sep().join([_("Faktor")] + ["" for l in labels]))
+    edges = run.get("edges") or []
+    for ed in edges:
+        lines.append("{0}{3}{1}{3}{2}".format(csv_cell(run["labels"].get(ed["src"], "?")),
+                                      csv_cell(run["labels"].get(ed["dst"], "?")), csv_num(ed["w"]), csv_sep()))
+    txt = "\ufeff" + "\r\n".join(lines) + "\r\n"
+    download(txt, "{}-{}.csv".format(safe_name(m["name"], "karte"), safe_name(run["name"], "lauf")), "text/csv")
+    toast(_("Lauf „{}“ als CSV exportiert.").format(run["name"]))
+
+
+def a_import(b, e):
+    el("import-file").click()
+
+
+SAFE_ID = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+
+
+def safe_id(v):
+    """True, wenn v als ID unbedenklich ist (nur Buchstaben, Ziffern, _ und -; max. 64 Zeichen).
+    IDs landen in HTML-/SVG-Attributen – fremde Zeichen könnten dort Code einschleusen."""
+    if not isinstance(v, str) or not v or len(v) > 64:
+        return False
+    for ch in v:
+        if ch not in SAFE_ID:
+            return False
+    return True
+
+
+def clean_map(raw):
+    """Prüft und bereinigt eine importierte Karte und gibt eine neue Karte zurück (oder None).
+
+    Baut alle Strukturen neu auf, statt Eingabedaten zu übernehmen: unsichere IDs werden durch neue ersetzt
+    (inkl. aller Verweise), Zahlen geprüft, Kanten zu fehlenden Knoten und Duplikate verworfen (Schleifen bleiben),
+    Faktoren auf ±10 begrenzt. Vergibt eine neue Karten-ID und macht den Namen eindeutig."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("nodes"), list):
+        return None
+    idmap = {}
+
+    def mid(v, prefix):
+        """Gibt für eine importierte ID eine sichere ID zurück (stabil innerhalb der Karte)."""
+        k = str(v) if v is not None else ""
+        if k in idmap:
+            return idmap[k]
+        nv = k if safe_id(k) else uid(prefix)
+        if k:
+            idmap[k] = nv
+        return nv
+
+    def num(v, d=0.0):
+        f = pfloat(v, d)
+        return f if f == f and abs(f) < 1e300 else d
+
+    nodes = []
+    ids = {}
+    for i, n in enumerate(raw["nodes"]):
+        if not isinstance(n, dict):
+            continue
+        if n.get("id") is not None and str(n.get("id")) in idmap:
+            continue  # doppelte ID
+        nid = mid(n.get("id"), "n")
+        if nid in ids:
+            continue
+        ids[nid] = True
+        nodes.append({"id": nid, "label": str(n.get("label", _("Knoten {}").format(i + 1)))[:200],
+                      "value": num(n.get("value", 0)),
+                      "x": num(n.get("x", (i % 5) * 200)), "y": num(n.get("y", (i // 5) * 150))})
+        if isinstance(n.get("c"), int):
+            nodes[-1]["c"] = n["c"] % len(PALETTE)
+        if isinstance(n.get("note"), str) and n["note"].strip():
+            nodes[-1]["note"] = n["note"][:NOTE_MAX]
+
+    def clean_edges(lst, known):
+        out, seen = [], {}
+        for ed in lst or []:
+            if not isinstance(ed, dict):
+                continue
+            ka, kb = str(ed.get("src", "")), str(ed.get("dst", ""))
+            a, b = idmap.get(ka), idmap.get(kb)
+            if known is not None and (a not in known or b not in known):
+                continue
+            if not a or not b or (a + ">" + b) in seen:
+                continue
+            seen[a + ">" + b] = True
+            eid = ed.get("id")
+            out.append({"id": eid if safe_id(eid) else uid("e"), "src": a, "dst": b, "w": clamp(num(ed.get("w", 0.5), 0.5), -10.0, 10.0)})
+            if isinstance(ed.get("note"), str) and ed["note"].strip():
+                out[-1]["note"] = ed["note"][:NOTE_MAX]
+        return out
+
+    def clean_numdict(d, cast):
+        out = {}
+        if isinstance(d, dict):
+            for k in d:
+                if str(k) in idmap:
+                    try:
+                        out[idmap[str(k)]] = cast(d[k])
+                    except Exception:
+                        pass
+        return out
+
+    edges = clean_edges(raw.get("edges"), ids)
+    sims = []
+    for r in raw.get("sims") or []:
+        if not (isinstance(r, dict) and isinstance(r.get("history"), list) and isinstance(r.get("nodes"), list)):
+            continue
+        rn = [mid(x, "n") for x in r["nodes"]]
+        hist = []
+        for row in r["history"]:
+            if isinstance(row, list) and len(row) == len(rn):
+                hist.append([num(v) for v in row])
+        if not hist or not rn:
+            continue
+        unit = r.get("unit") if r.get("unit") in ("pct", "abs") else "pct"
+        st = r.get("stable")
+        run = {"id": uid("r"), "name": str(r.get("name") or _("Lauf"))[:200], "created": str(r.get("created") or now_iso())[:40],
+               "model": r.get("model") if r.get("model") in ("abs", "log", "lin") else "abs",
+               "rounds": len(hist) - 1, "damping": clamp(num(r.get("damping", 1.0), 1.0), 0.0, 1.0),
+               "unit": unit, "nodes": rn, "history": hist,
+               "stable": st if isinstance(st, int) and 0 <= st <= len(hist) else None,
+               "labels": clean_numdict(r.get("labels"), lambda v: str(v)[:200]),
+               "colors": clean_numdict(r.get("colors"), lambda v: int(v) % len(PALETTE)),
+               "changes": clean_numdict(r.get("changes"), lambda v: num(v)),
+               "edges": clean_edges(r.get("edges"), None)}
+        if isinstance(r.get("deltas"), dict):
+            run["deltas"] = clean_numdict(r.get("deltas"), lambda v: num(v))
+        sims.append(run)
+    m = new_map(str(raw.get("name") or _("Importierte Karte"))[:200])
+    m["nodes"], m["edges"], m["sims"] = nodes, edges, sims
+    ensure_map(m)
+    m["created"] = str(raw.get("created") or now_iso())[:40]
+    dr = raw.get("draft")
+    if isinstance(dr, dict):
+        d = m["draft"]
+        d["changes"] = dict([(k, v) for (k, v) in clean_numdict(dr.get("changes"), lambda v: num(v)).items() if k in ids])
+        if dr.get("unit") in ("pct", "abs"):
+            d["unit"] = dr["unit"]
+        d["rounds"] = int(clamp(num(dr.get("rounds", 12), 12), 1, 200))
+        d["damping"] = clamp(num(dr.get("damping", 1.0), 1.0), 0.0, 1.0)
+        d["model"] = "abs"
+    names = [x["name"] for x in S["maps"]]
+    if m["name"] in names:
+        base = m["name"] + _(" (importiert)")
+        name, k = base, 2
+        while name in names:
+            name = "{} {}".format(base, k)
+            k += 1
+        m["name"] = name
+    return m
+
+
+async def import_files(files):
+    count, runs, errors, last = 0, 0, [], None
+    for i in range(files.length):
+        f = files.item(i)
+        fname = str(f.name)
+        try:
+            try:
+                data = json.loads(str(await f.text()))
+            except Exception:
+                errors.append(fname + _(": keine gültige JSON-Datei"))
+                continue
+            if isinstance(data, dict) and isinstance(data.get("maps"), list):
+                items = data["maps"]
+            elif isinstance(data, list):
+                items = data
+            else:
+                items = [data]
+            ok = 0
+            for raw in items:
+                m = clean_map(raw)
+                if m:
+                    S["maps"].append(m)
+                    last = m["id"]
+                    ok += 1
+                    runs += len(m["sims"])
+            if ok == 0:
+                errors.append(fname + _(": keine Karte gefunden"))
+            count += ok
+        except Exception as ex:
+            errors.append(fname + ": " + str(ex))
+    if last:
+        switch_map(last)
+    if count:
+        if is_en():
+            msg = "{} map{} with {} run{} imported.".format(count, "" if count == 1 else "s", runs, "" if runs == 1 else "s")
+        else:
+            msg = "{} Karte{} mit {} {} importiert.".format(count, "" if count == 1 else "n", runs,
+                                                           "Lauf" if runs == 1 else "Läufen")
+        if errors:
+            msg += _(" Fehler: ") + "; ".join(errors)
+        toast(msg, "warn" if errors else "ok")
+    else:
+        toast(_("Import fehlgeschlagen – ") + ("; ".join(errors) or _("keine Datei")), "err")
+
+
+async def on_import(e):
+    inp = el("import-file")
+    if inp.files.length:
+        await import_files(inp.files)
+    inp.value = ""
+
+
+def has_files(e):
+    dt = e.dataTransfer
+    if is_none(dt):
+        return False
+    try:
+        return int(dt.types.indexOf("Files")) >= 0
+    except Exception:
+        return False
+
+
+def on_dragover(e):
+    if has_files(e):
+        e.preventDefault()
+        document.body.classList.add("dropping")
+
+
+def on_dragleave(e):
+    if is_none(e.relatedTarget):
+        document.body.classList.remove("dropping")
+
+
+def on_drop(e):
+    document.body.classList.remove("dropping")
+    if not has_files(e):
+        return
+    e.preventDefault()
+    asyncio.create_task(import_files(e.dataTransfer.files))
+
+
+def switch_map(mid):
+    stop()
+    S["current"] = mid
+    S["sel"] = None
+    S["run"] = None
+    S["pending"] = None
+    save()
+    render_all()
+    fit()
+
+
+def a_select_node(b, e):
+    leave_sim_view()
+    S["sel"] = {"type": "node", "id": attr(b, "data-id")}
+    render_edit()
+
+
+def a_select_edge(b, e):
+    S["sel"] = {"type": "edge", "id": attr(b, "data-id")}
+    render_edit()
+
+
+def a_edge_set(b, e):
+    m = cur()
+    ed = edge_by(m, S["sel"]["id"])
+    ed["w"] = float(attr(b, "data-w"))
+    save()
+    render_edit()
+
+
+def a_edge_reverse(b, e):
+    m = cur()
+    ed = edge_by(m, S["sel"]["id"])
+    for o in m["edges"]:
+        if o["src"] == ed["dst"] and o["dst"] == ed["src"]:
+            window.alert(_("In Gegenrichtung existiert bereits eine Kante."))
+            return
+    ed["src"], ed["dst"] = ed["dst"], ed["src"]
+    save()
+    render_edit()
+
+
+def any_loop(m, nid):
+    for e in m["edges"]:
+        if e["src"] == nid and e["dst"] == nid:
+            return True
+    return False
+
+
+def a_edge_self(b, e):
+    if S["sel"] and S["sel"].get("type") == "node":
+        leave_sim_view()
+        add_edge(S["sel"]["id"], S["sel"]["id"])
+        render_canvas()
+
+
+def a_edge_from_sel(b, e):
+    S["mode"] = "edge"
+    render_modes()
+    S["pending"] = S["sel"]["id"]
+    render_canvas()
+
+
+def a_run_open(b, e):
+    rid = attr(b, "data-id")
+    if S["run"] == rid:
+        return
+    open_run(rid)
+
+
+def a_run_rename(b, e):
+    m = cur()
+    run = run_by(m, attr(b, "data-id"))
+    name = window.prompt(_("Name des Laufs:"), run["name"])
+    if is_none(name) or not str(name).strip():
+        return
+    run["name"] = str(name).strip()
+    save()
+    render_runs()
+
+
+def a_run_reuse(b, e):
+    m = cur()
+    run = run_by(m, attr(b, "data-id"))
+    d = m["draft"]
+    d["changes"] = dict(run["changes"])
+    d["unit"] = run.get("unit", "pct")
+    d["rounds"] = run["rounds"]
+    d["damping"] = run["damping"]
+    save()
+    close_run()
+    set_tab("sim")
+
+
+UNDO_RUNS = {"map": None, "sims": None}
+
+
+def a_runs_clear(b, e):
+    """Löscht alle Läufe der aktuellen Karte ohne Rückfrage; „Rückgängig“ in der Meldung stellt sie wieder her."""
+    m = cur()
+    if not m or not m["sims"]:
+        return
+    n = len(m["sims"])
+    UNDO_RUNS["map"] = m["id"]
+    UNDO_RUNS["sims"] = m["sims"]
+    m["sims"] = []
+    close_run()
+    save()
+    render_runs()
+    msg = (_("1 Lauf gelöscht.") if n == 1 else _("{} Läufe gelöscht.").format(n))
+    toast(msg, "ok", "runs-undo", _("Rückgängig"))
+
+
+def a_runs_undo(b, e):
+    m = None
+    for mm in S["maps"]:
+        if mm["id"] == UNDO_RUNS["map"]:
+            m = mm
+    if m is None or UNDO_RUNS["sims"] is None:
+        return
+    m["sims"] = UNDO_RUNS["sims"] + m["sims"]
+    UNDO_RUNS["map"] = None
+    UNDO_RUNS["sims"] = None
+    save()
+    render_runs()
+    toast(_("Läufe wiederhergestellt."))
+
+
+def a_run_delete(b, e):
+    m = cur()
+    rid = attr(b, "data-id")
+    run = run_by(m, rid)
+    if not run:
+        return
+    m["sims"] = [r for r in m["sims"] if r["id"] != rid]  # ohne Rückfrage: ein Klick löscht
+    if S["run"] == rid:
+        close_run()
+    save()
+    render_runs()
+    toast(_("Lauf „{}“ gelöscht.").format(run["name"]))
+
+
+def a_sim_reset(b, e):
+    m = cur()
+    m["draft"]["changes"] = {}
+    save()
+    render_sim_form()
+
+
+ACTIONS = {
+    "mode": a_mode, "tab": a_tab,
+    "zoom-in": lambda b, e: zoom(1 / 1.25), "zoom-out": lambda b, e: zoom(1.25),
+    "fit": lambda b, e: fit(), "toggle-size": lambda b, e: toggle_size(), "fullmap": lambda b, e: set_fullmap(not FULL["on"]),
+    "help": lambda b, e: el("help").showModal(),
+    "map-new": a_map_new, "map-rename": a_map_rename, "map-dup": a_map_dup, "map-sample": a_map_sample, "map-undo": a_map_undo,
+    "map-delete": a_map_delete, "export-map": a_export_map, "export-all": a_export_all,
+    "export-run-csv": a_export_run_csv, "import": a_import,
+    "select-node": a_select_node, "select-edge": a_select_edge, "delete-sel": lambda b, e: delete_sel(),
+    "edge-set": a_edge_set, "edge-reverse": a_edge_reverse, "edge-from-sel": a_edge_from_sel, "edge-self": a_edge_self, "chart-y": a_chart_y,
+    "sim-run": lambda b, e: run_sim(), "sim-reset": a_sim_reset, "sim-close": lambda b, e: close_run(),
+    "pb-play": lambda b, e: play(), "pb-first": lambda b, e: (stop(), set_round(0)),
+    "run-open": a_run_open, "run-rename": a_run_rename, "run-reuse": a_run_reuse,
+    "run-delete": a_run_delete, "runs-clear": a_runs_clear, "runs-undo": a_runs_undo,
+}
+
+
+def on_click(e):
+    b = closest(e.target, "[data-action]")
+    if not b:
+        return
+    act = attr(b, "data-action")
+    menu = closest(b, "details")
+    if menu:
+        menu.removeAttribute("open")
+    h = ACTIONS.get(act)
+    if h:
+        h(b, e)
+
+
+def on_input(e):
+    t = e.target
+    tid = attr(t, "id")
+    m = cur()
+    if not m:
+        return
+    sel = S["sel"]
+    if tid == "node-edit" and EDIT["id"]:
+        n = node_by(m, EDIT["id"])
+        if n:
+            n["label"] = str(t.value)
+            render_canvas()
+            render_node_list()
+            f = el("f-node-label")
+            if not is_none(f):
+                f.value = n["label"]
+        return
+    if tid == "f-node-label" and sel:
+        n = node_by(m, sel["id"])
+        n["label"] = str(t.value)
+        save_soon()
+        render_canvas()
+        render_node_list()
+    elif tid == "f-node-value" and sel:
+        v = pfloat(t.value, None)
+        if v is not None:
+            node_by(m, sel["id"])["value"] = v
+            save_soon()
+            render_canvas()
+            render_node_list()
+    elif tid in ("f-edge-range", "f-edge-num") and sel:
+        v = pfloat(t.value, None)
+        if v is None:
+            return
+        v = clamp(round(v * 1000) / 1000.0, -10.0, 10.0)  # bis zu drei Nachkommastellen
+        ed = edge_by(m, sel["id"])
+        ed["w"] = v
+        other = el("f-edge-num" if tid == "f-edge-range" else "f-edge-range")
+        other.value = str(v)
+        el("edge-explain").innerHTML = edge_explain(ed, node_by(m, ed["src"]), node_by(m, ed["dst"]))
+        save_soon()
+        render_canvas()
+    elif tid in ("f-node-note", "f-edge-note") and sel:
+        obj = node_by(m, sel["id"]) if tid == "f-node-note" else edge_by(m, sel["id"])
+        if obj:
+            had = bool(obj.get("note"))
+            txt = str(t.value)[:NOTE_MAX]
+            if txt.strip():
+                obj["note"] = txt
+            elif "note" in obj:
+                del obj["note"]
+            save_soon()
+            if had != bool(obj.get("note")):
+                render_canvas()  # Markierung „hat Beschreibung“ an- oder ausschalten
+    elif tid == "pb-range":
+        stop()
+        set_round(int(pfloat(t.value, 0)))
+    elif tid in ("sim-rounds", "sim-damping") or closest(t, "#changes-body"):
+        read_sim_form()
+        save_soon()
+        nid = attr(t, "data-id")
+        if nid and node_by(m, nid):
+            el("pv-" + nid).textContent = preview_txt(node_by(m, nid), pfloat(t.value, None), m["draft"]["unit"])
+
+
+def on_change(e):
+    t = e.target
+    if attr(t, "id") == "map-select":
+        switch_map(str(t.value))
+    elif attr(t, "name") == "unit":
+        set_unit(str(t.value))
+    elif attr(t, "id") in ("f-node-label", "f-node-value"):
+        render_sim_form()
+    elif attr(t, "id") == "f-edge-num" and S["sel"] and S["sel"].get("type") == "edge":
+        ed = edge_by(cur(), S["sel"]["id"])
+        if ed:
+            t.value = "{:.3f}".format(float(ed["w"])).rstrip("0").rstrip(".")  # gerundeten bzw. auf −10 … +10 begrenzten Wert anzeigen
+
+
+def on_key(e):
+    tag = str(e.target.tagName).lower()
+    if tag in ("input", "textarea", "select"):
+        if str(e.key) == "Enter" and attr(e.target, "id") == "f-node-label":
+            e.target.blur()
+        return
+    k = str(e.key)
+    if (k in ("Enter", "F2") and S["sel"] and S["sel"].get("type") == "node"
+            and tag in ("body", "svg", "g", "rect", "text", "path")):
+        e.preventDefault()
+        start_inline_edit(S["sel"]["id"])
+        return
+    if k in ("Delete", "Backspace") and S["sel"]:
+        e.preventDefault()
+        delete_sel()
+    elif k in ("v", "V"):
+        set_mode("select")
+    elif k in ("n", "N"):
+        leave_sim_view()
+        set_mode("node")
+    elif k in ("k", "K", "e", "E"):
+        leave_sim_view()
+        set_mode("edge")
+    elif k in ("f", "F"):
+        fit()
+    elif k in ("g", "G"):
+        toggle_size()
+    elif k == "?":
+        el("help").showModal()
+    elif k in ("m", "M"):
+        set_fullmap(not FULL["on"])
+    elif k == "Escape" and FULL["on"] and not S["sel"] and not S.get("pending"):
+        set_fullmap(False)
+    elif k == "Escape":
+        S["pending"] = None
+        S["sel"] = None
+        set_mode("select")
+        render_edit()
+    elif k == " " and S["run"]:
+        e.preventDefault()
+        play()
+
+
+LAST_W = [0.0]
+
+
+def on_resize(*args):
+    """Fläche hat sich geändert (Fenster, Trenner): Maßstab und Mittelpunkt beibehalten, nur den Ausschnitt anpassen."""
+    r = stage_rect()
+    w = float(r.width)
+    if w > 0 and LAST_W[0] > 0 and abs(w - LAST_W[0]) > 0.5:
+        v = S["view"]
+        cx = v["x"] + v["w"] / 2.0
+        v["w"] = v["w"] * w / LAST_W[0]
+        v["x"] = cx - v["w"] / 2.0
+    if w > 0:
+        LAST_W[0] = w
+    render_canvas()
+
+
+# ---------------------------------------------------------------- Trenner (Breite der Seitenleiste)
+PANEL_MIN, PANEL_DEFAULT, STAGE_MIN = 300, 400, 320
+
+
+def panel_bounds():
+    lw = float(document.querySelector(".layout").getBoundingClientRect().width)
+    return PANEL_MIN, max(PANEL_MIN, min(900, int(lw - STAGE_MIN - 8)))
+
+
+def set_panel_w(w, persist=False):
+    """Setzt die Breite der Seitenleiste (px, begrenzt) über die CSS-Variable --panel-w."""
+    lo, hi = panel_bounds()
+    w = int(clamp(float(w), lo, hi))
+    document.querySelector(".layout").style.setProperty("--panel-w", "{}px".format(w))
+    ne = el("node-edit")
+    listen(ne, "keydown", on_edit_key)
+    listen(ne, "blur", on_edit_blur)
+    sp = el("splitter")
+    sp.setAttribute("aria-valuenow", str(w))
+    sp.setAttribute("aria-valuemax", str(hi))
+    S["settings"]["panelW"] = w
+    if persist:
+        save()
+
+
+def on_split_down(e):
+    if int(e.button) != 0:
+        return
+    e.preventDefault()
+    el("splitter").setPointerCapture(e.pointerId)
+    S["split"] = True
+    document.body.classList.add("resizing")
+
+
+def on_split_move(e):
+    if not S.get("split"):
+        return
+    r = document.querySelector(".layout").getBoundingClientRect()
+    set_panel_w(float(r.right) - float(e.clientX) - 4)
+
+
+def on_split_up(e):
+    if not S.get("split"):
+        return
+    S["split"] = False
+    document.body.classList.remove("resizing")
+    save()
+
+
+def on_split_key(e):
+    k = str(e.key)
+    w = S["settings"].get("panelW", PANEL_DEFAULT)
+    step = 80 if e.shiftKey else 24
+    if k == "ArrowLeft":
+        set_panel_w(w + step, True)
+    elif k == "ArrowRight":
+        set_panel_w(w - step, True)
+    elif k == "Home":
+        set_panel_w(panel_bounds()[1], True)
+    elif k == "End":
+        set_panel_w(PANEL_MIN, True)
+    elif k == "Enter":
+        set_panel_w(PANEL_DEFAULT, True)
+    else:
+        return
+    e.preventDefault()
+    e.stopPropagation()
+
+
+PANEL_W = [0.0]
+
+
+def on_panel_resize(*args):
+    """Seitenleiste hat ihre Breite geändert: Diagramm in passender Breite neu zeichnen."""
+    w = float(el("run-detail").clientWidth)
+    if abs(w - PANEL_W[0]) > 2:
+        PANEL_W[0] = w
+        if S.get("run") and S.get("tab") == "runs":
+            render_run_detail()
+
+
+PANEL_RESIZE = create_proxy(on_panel_resize)
+
+
+def on_split_dbl(e):
+    set_panel_w(PANEL_DEFAULT, True)
+
+
+RESIZE = create_proxy(on_resize)
+
+
+# ---------------------------------------------------------------- Verknüpftes Hovern
+def apply_hover():
+    """Setzt die Klasse "hl" auf alle Elemente des hervorgehobenen Knotens (data-hl) und seine Kanten (data-ends)."""
+    hid = S.get("hover")
+    old = document.querySelectorAll(".hl")
+    for i in range(old.length):
+        old.item(i).classList.remove("hl")
+    if not hid:
+        document.body.classList.remove("hovering")
+        node_tip()
+        return
+    els = document.querySelectorAll('[data-hl="{0}"], [data-ends~="{0}"]'.format(hid))
+    if els.length == 0:
+        document.body.classList.remove("hovering")
+        node_tip()
+        return
+    document.body.classList.add("hovering")
+    for i in range(els.length):
+        els.item(i).classList.add("hl")
+    node_tip()
+
+
+def set_hover(hid):
+    if hid == S.get("hover"):
+        return
+    S["hover"] = hid
+    apply_hover()
+
+
+def on_over(e):
+    if S["drag"]:
+        return
+    eid = attr(closest(e.target, "[data-edge]"), "data-edge")
+    changed = eid != S.get("ehover")
+    S["ehover"] = eid
+    before = S.get("hover")
+    set_hover(attr(closest(e.target, "[data-hl]"), "data-hl"))
+    if changed and before == S.get("hover"):
+        node_tip()
+
+
+def on_out(e):
+    if str(e.pointerType) == "touch":
+        return  # Touch: Hervorhebung bleibt bis zum nächsten Antippen
+    if is_none(e.relatedTarget):
+        S["ehover"] = None
+        set_hover(None)
+        node_tip()
+
+
+def listen(target, ev, fn, opts=None):
+    p = create_proxy(fn)
+    PROXIES.append(p)
+    if opts is None:
+        target.addEventListener(ev, p)
+    else:
+        target.addEventListener(ev, p, to_js(opts))
+
+
+# ---------------------------------------------------------------- Start
+# Englische Übersetzungen: deutscher Originaltext → Englisch (Platzhalter {} und HTML identisch halten).
+EN = {
+    " (Kopie)": " (copy)",
+    " (importiert)": " (imported)",
+    "Der Browser erlaubt hier kein Vollbild – die Karte füllt das Fenster.": "The browser does not allow full screen here – the map fills the window.",
+    "Beispielkarte „{}“ hinzugefügt": "Sample map “{}” added",
+    " <small>(Start 0, kein %)</small>": " <small>(start 0, no %)</small>",
+    " Ab Runde {} keine weitere Änderung.": " No further change from round {} on.",
+    " Fehler: ": " Error: ",
+    "(ohne Text)": "(no text)",
+    "1 Kante": "1 edge",
+    ": keine Karte gefunden": ": no map found",
+    ": keine gültige JSON-Datei": ": not a valid JSON file",
+    "<b><i class=\"sw\" style=\"background:{col}\"></i>{lab}</b><span>Runde {t}: <strong>{val}</strong></span><span>Start: {s0}</span><span>Änderung: <em class=\"{cls}\">{chg}</em></span>": "<b><i class=\"sw\" style=\"background:{col}\"></i>{lab}</b><span>Round {t}: <strong>{val}</strong></span><span>Start: {s0}</span><span>Change: <em class=\"{cls}\">{chg}</em></span>",
+    "<b><i class=\"sw\" style=\"background:{}\"></i>{}</b><span>Runde {}: <strong class=\"{}\">{}</strong> <em>({}, {})</em></span>": "<b><i class=\"sw\" style=\"background:{}\"></i>{}</b><span>Round {}: <strong class=\"{}\">{}</strong> <em>({}, {})</em></span>",
+    "<b><i class=\"sw\" style=\"background:{}\"></i>{}</b><span>Runde {}: <strong>{}</strong> <em class=\"{}\">{}</em></span>": "<b><i class=\"sw\" style=\"background:{}\"></i>{}</b><span>Round {}: <strong>{}</strong> <em class=\"{}\">{}</em></span>",
+    "<button class=\"small\" data-action=\"edge-reverse\">Richtung umkehren</button>": "<button class=\"small\" data-action=\"edge-reverse\">Reverse direction</button>",
+    "<button class=\"small\" data-action=\"edge-self\">Schleife auf sich selbst</button>": "<button class=\"small\" data-action=\"edge-self\">Loop to itself</button>",
+    "<div class=\"card empty\"><h2>Nichts ausgewählt</h2><p class=\"note\">Wähle einen Knoten oder eine Kante auf der Fläche, um Text, Wert oder Faktor zu ändern.</p><p class=\"note\"><b>Faktor</b> zwischen −10 und +10: Anteil der absoluten Änderung des Startknotens, um den sich der Zielknoten ändert. Start 50 verdoppelt sich (+50), Faktor 1,0 → Ziel +50; Faktor 0,5 → Ziel +25.</p><p class=\"note\">Tastatur: V Auswählen · N Knoten · K Kante · Entf Löschen · F Einpassen · G Größe nach Wert · M Vollbild · ? Hilfe</p></div>": "<div class=\"card empty\"><h2>Nothing selected</h2><p class=\"note\">Select a node or an edge on the canvas to change its text, value or factor.</p><p class=\"note\"><b>Factor</b> between −10 and +10: share of the absolute change of the source node by which the target node changes. Source 50 doubles (+50), factor 1.0 → target +50; factor 0.5 → target +25.</p><p class=\"note\">Keyboard: V Select · N Node · K Edge · Del Delete · F Fit · G Size by value · M Full screen · ? Help</p></div>",
+    "<div class=\"card\"><div class=\"card-head\"><h2>Kante</h2><button class=\"danger small\" data-action=\"delete-sel\">Löschen</button></div><p class=\"route\"><b>{a}</b> <span>{arr}</span> <b>{b}</b></p><label>Faktor<div class=\"wrow\"><input type=\"range\" id=\"f-edge-range\" min=\"-10\" max=\"10\" step=\"0.1\" value=\"{w}\"><input type=\"number\" id=\"f-edge-num\" min=\"-10\" max=\"10\" step=\"0.05\" value=\"{w}\"></div></label><div class=\"row quick\">{quick}</div>{notef}<p class=\"note\" id=\"edge-explain\">{ex}</p>{rev}</div>": "<div class=\"card\"><div class=\"card-head\"><h2>Edge</h2><button class=\"danger small\" data-action=\"delete-sel\">Delete</button></div><p class=\"route\"><b>{a}</b> <span>{arr}</span> <b>{b}</b></p><label>Factor<div class=\"wrow\"><input type=\"range\" id=\"f-edge-range\" min=\"-10\" max=\"10\" step=\"0.1\" value=\"{w}\"><input type=\"number\" id=\"f-edge-num\" min=\"-10\" max=\"10\" step=\"0.05\" value=\"{w}\"></div></label><div class=\"row quick\">{quick}</div>{notef}<p class=\"note\" id=\"edge-explain\">{ex}</p>{rev}</div>",
+    "<div class=\"card\"><div class=\"card-head\"><h2>Knoten</h2><button class=\"danger small\" data-action=\"delete-sel\">Löschen</button></div><label>Text<input type=\"text\" id=\"f-node-label\" value=\"{lab}\" autocomplete=\"off\"></label><label>Wert<input type=\"number\" step=\"any\" id=\"f-node-value\" value=\"{val}\"></label>{warn}{notef}<div class=\"grid2 rel\"><div><h4>Eingehend</h4><ul class=\"mini\">{ins}</ul></div><div><h4>Ausgehend</h4><ul class=\"mini\">{outs}</ul></div></div><div class=\"row\"><button class=\"small\" data-action=\"edge-from-sel\">Kante von hier ziehen</button>{loop}</div></div>": "<div class=\"card\"><div class=\"card-head\"><h2>Node</h2><button class=\"danger small\" data-action=\"delete-sel\">Delete</button></div><label>Text<input type=\"text\" id=\"f-node-label\" value=\"{lab}\" autocomplete=\"off\"></label><label>Value<input type=\"number\" step=\"any\" id=\"f-node-value\" value=\"{val}\"></label>{warn}{notef}<div class=\"grid2 rel\"><div><h4>Incoming</h4><ul class=\"mini\">{ins}</ul></div><div><h4>Outgoing</h4><ul class=\"mini\">{outs}</ul></div></div><div class=\"row\"><button class=\"small\" data-action=\"edge-from-sel\">Draw edge from here</button>{loop}</div></div>",
+    "<div class=\"card\"><div class=\"card-head\"><h2>{name}</h2><span class=\"tag\">Runde {t} / {n}</span></div><div class=\"row run-tools\"><button class=\"small\" data-action=\"export-run-csv\">Als CSV exportieren</button></div><p class=\"note\">{sum}. Dämpfung {damp}.{stable}</p><div class=\"chart-head\"><span class=\"chart-title\">{ytitle}</span><div class=\"seg chart-seg\" role=\"group\" aria-label=\"Y-Achse\"><button class=\"small\" data-action=\"chart-y\" data-v=\"abs\" aria-pressed=\"{pa}\">Absolut</button><button class=\"small\" data-action=\"chart-y\" data-v=\"pct\" aria-pressed=\"{pp}\">Änderung %</button></div></div><div class=\"chart\">{chart}<p class=\"axis-note\">{note}</p></div><table class=\"res\"><thead><tr><th>Knoten</th><th>Start</th><th>Runde {t}</th><th>Δ</th></tr></thead><tbody>{rows}</tbody></table>{unch}</div>": "<div class=\"card\"><div class=\"card-head\"><h2>{name}</h2><span class=\"tag\">Round {t} / {n}</span></div><div class=\"row run-tools\"><button class=\"small\" data-action=\"export-run-csv\">Export as CSV</button></div><p class=\"note\">{sum}. Damping {damp}.{stable}</p><div class=\"chart-head\"><span class=\"chart-title\">{ytitle}</span><div class=\"seg chart-seg\" role=\"group\" aria-label=\"Y axis\"><button class=\"small\" data-action=\"chart-y\" data-v=\"abs\" aria-pressed=\"{pa}\">Absolute</button><button class=\"small\" data-action=\"chart-y\" data-v=\"pct\" aria-pressed=\"{pp}\">Change %</button></div></div><div class=\"chart\">{chart}<p class=\"axis-note\">{note}</p></div><table class=\"res\"><thead><tr><th>Node</th><th>Start</th><th>Round {t}</th><th>Δ</th></tr></thead><tbody>{rows}</tbody></table>{unch}</div>",
+    "<li class=\"muted\">Noch keine Knoten.</li>": "<li class=\"muted\">No nodes yet.</li>",
+    "<li class=\"muted\">Noch keine Läufe. Starte im Tab „Simulation“ einen Durchlauf.</li>": "<li class=\"muted\">No runs yet. Start a run in the “Simulation” tab.</li>",
+    "<li class=\"muted\">keine</li>": "<li class=\"muted\">none</li>",
+    "<li class=\"run{on}\"><button class=\"row-btn\" data-action=\"run-open\" data-id=\"{id}\"><span><b>{name}</b><small>{date} · {model}, {rounds} Runden</small><small>{sum}</small></span></button><div class=\"run-actions\"><button class=\"small\" data-action=\"run-rename\" data-id=\"{id}\">Umbenennen</button><button class=\"small\" data-action=\"run-reuse\" data-id=\"{id}\">Als Vorlage</button><button class=\"small danger\" data-action=\"run-delete\" data-id=\"{id}\">Löschen</button></div></li>": "<li class=\"run{on}\"><button class=\"row-btn\" data-action=\"run-open\" data-id=\"{id}\"><span><b>{name}</b><small>{date} · {model}, {rounds} rounds</small><small>{sum}</small></span></button><div class=\"run-actions\"><button class=\"small\" data-action=\"run-rename\" data-id=\"{id}\">Rename</button><button class=\"small\" data-action=\"run-reuse\" data-id=\"{id}\">Use as template</button><button class=\"small danger\" data-action=\"run-delete\" data-id=\"{id}\">Delete</button></div></li>",
+    "<p class=\"note\">Unverändert: ": "<p class=\"note\">Unchanged: ",
+    "<p class=\"note\">Wähle einen Lauf, um ihn auf der Karte abzuspielen.</p>": "<p class=\"note\">Select a run to play it back on the map.</p>",
+    "<tr><td colspan=\"4\" class=\"muted\">Keine Veränderung.</td></tr>": "<tr><td colspan=\"4\" class=\"muted\">No change.</td></tr>",
+    "<tr><td colspan=\"4\" class=\"muted\">Noch keine Knoten.</td></tr>": "<tr><td colspan=\"4\" class=\"muted\">No nodes yet.</td></tr>",
+    "Absolut: Jede Runde gibt ein Knoten seine absolute Änderung der Vorrunde weiter. Ziel ändert sich um Faktor × Änderung des Starts (Faktoren mehrerer Eingänge addieren sich).": "Absolute: every round a node passes on its absolute change from the previous round. The target changes by factor × change of the source (inputs from several edges add up).",
+    "Abspielen": "Play",
+    "Alle Knoten gleich groß – klicken, damit die Größe vom Wert abhängt (G)": "All nodes the same size – click to make size depend on value (G)",
+    "Als absoluter Betrag, der zum Wert addiert wird: +25 bei Wert 50 ergibt 75, −10 ergibt 40. Leer = keine Änderung.": "As an absolute amount added to the value: +25 at value 50 gives 75, −10 gives 40. Empty = no change.",
+    "Beispiel: Stadtverkehr": "Example: City traffic",
+    "Wie viele Wege mit dem Fahrrad zurückgelegt werden. Index: 100 = heutiger Stand.": "How many trips are made by bicycle. Index: 100 = today's level.",
+    "Menge der Fahrten mit dem eigenen Auto. Index: 100 = heutiger Stand.": "Number of trips by private car. Index: 100 = today's level.",
+    "Wie sauber die Luft ist – höher ist besser (weniger Stickoxide und Feinstaub). Index: 100 = heutiger Stand.": "How clean the air is – higher is better (less nitrogen oxides and particulate matter). Index: 100 = today's level.",
+    "Umfang und Qualität des Radwegenetzes. Hier setzt der vorbereitete Anstoß an: +100 % = doppelt so viele gute Radwege.": "Extent and quality of the cycle lane network. The prepared impulse starts here: +100% = twice as many good cycle lanes.",
+    "Zahl der öffentlich nutzbaren Parkplätze. Index: 100 = heutiger Stand.": "Number of publicly available parking spaces. Index: 100 = today's level.",
+    "Fahrgäste in Bus und Bahn. Index: 100 = heutiger Stand.": "Passengers on buses and trains. Index: 100 = today's level.",
+    "Verkehrslärm, dem die Anwohnerinnen und Anwohner ausgesetzt sind – höher ist lauter. Index: 100 = heutiger Stand.": "Traffic noise residents are exposed to – higher is louder. Index: 100 = today's level.",
+    "Sichere, durchgehende Radwege bringen mehr Menschen aufs Rad. Nicht jeder neue Radweg wird voll genutzt, daher etwas mehr als die Hälfte der Änderung.": "Safe, continuous cycle lanes get more people cycling. Not every new lane is fully used, so a little more than half of the change carries over.",
+    "Wer Rad fährt, lässt oft das Auto stehen. Ein Teil der neuen Radfahrten ersetzt aber Fußwege statt Autofahrten, deshalb nur −0,4.": "People who cycle often leave the car at home. Some new bike trips replace walking rather than driving, hence only −0.4.",
+    "Abgase und Abrieb verschlechtern die Luft. Heizungen und Industrie tragen ebenfalls bei, deshalb nur die Hälfte der Änderung.": "Exhaust and wear particles worsen the air. Heating and industry contribute as well, so only half of the change carries over.",
+    "Verkehrslärm in Städten stammt überwiegend vom Autoverkehr: mehr Autos bedeuten deutlich mehr Lärm.": "Traffic noise in cities comes mostly from cars: more cars mean considerably more noise.",
+    "Wo man leicht parken kann, fährt man eher mit dem Auto – das Angebot erzeugt zusätzlichen Verkehr.": "Where parking is easy, people are more likely to drive – the supply creates additional traffic.",
+    "Mehr Autoverkehr erhöht den Druck, zusätzliche Parkplätze zu schaffen. Zusammen mit der Gegenkante eine sich selbst verstärkende Rückkopplung.": "More car traffic increases the pressure to create more parking. Together with the opposite edge this forms a self-reinforcing feedback loop.",
+    "Wer Bus und Bahn nutzt, fährt seltener Auto.": "People who use buses and trains drive less.",
+    "Bei sauberer Luft ist Radfahren angenehmer – ein schwacher Effekt. Schließt die verstärkende Schleife Radverkehr → Autoverkehr → Luftqualität → Radverkehr.": "Cycling is more pleasant when the air is clean – a weak effect. Closes the reinforcing loop cycling → car traffic → air quality → cycling.",
+    "Rad und ÖPNV ergänzen sich, etwa mit dem Rad zur Haltestelle oder durch Fahrradmitnahme – ein kleiner positiver Effekt.": "Cycling and public transport complement each other, e.g. riding to the stop or taking the bike on the train – a small positive effect.",
+    "Die Karte enthält noch keine Knoten.": "The map has no nodes yet.",
+    "Diese Karte hat noch keinen gespeicherten Lauf.": "This map has no saved run yet.",
+    "Es ist keine Änderung angegeben. Trotzdem simulieren?": "No change has been entered. Simulate anyway?",
+    "Faktor": "Factor",
+    "Import fehlgeschlagen – ": "Import failed – ",
+    "Importierte Karte": "Imported map",
+    "In Gegenrichtung existiert bereits eine Kante.": "There is already an edge in the opposite direction.",
+    "In Prozent des aktuellen Werts: +100 = verdoppeln (Wert 50 → +50), −50 = halbieren. Leer = keine Änderung.": "In percent of the current value: +100 = double (value 50 → +50), −50 = halve. Empty = no change.",
+    "Jetzt den Zielknoten antippen – denselben Knoten noch einmal für eine Schleife.": "Now tap the target node – the same node again for a loop.",
+    "Karte „{}“ exportiert.": "Map “{}” exported.",
+    "Karte „{}“ gelöscht.": "Map “{}” deleted.",
+    "Karte „{}“ wiederhergestellt.": "Map “{}” restored.",
+    "Knoten ziehen zum Verschieben, Fläche ziehen zum Bewegen, Mausrad zum Zoomen. Doppelklick auf die Fläche legt einen Knoten an, auf einen Knoten bearbeitet seinen Text.": "Drag nodes to move them, drag the canvas to pan, mouse wheel to zoom. Double-click on the canvas creates a node, on a node edits its text.",
+    "Knoten {}": "Node {}",
+    "Knotengröße hängt vom Wert ab – klicken zum Ausschalten (G)": "Node size depends on value – click to turn off (G)",
+    "Lauf": "Run",
+    "Lauf {}": "Run {}",
+    "Lauf „{}“ als CSV exportiert.": "Run “{}” exported as CSV.",
+    "Lauf „{}“ gelöscht.": "Run “{}” deleted.",
+    "1 Lauf gelöscht.": "1 run deleted.",
+    "{} Läufe gelöscht.": "{} runs deleted.",
+    "Rückgängig": "Undo",
+    "Beschreibung": "Description",
+    "Wird beim Darüberfahren angezeigt": "Shown on hover",
+    "<b>{a} {arr} {b}</b><span>Faktor: <strong>{w}</strong></span>": "<b>{a} {arr} {b}</b><span>Factor: <strong>{w}</strong></span>",
+    "<b><i class=\"sw\" style=\"background:{col}\"></i>{lab}</b><span>Wert: <strong>{val}</strong></span>": "<b><i class=\"sw\" style=\"background:{col}\"></i>{lab}</b><span>Value: <strong>{val}</strong></span>",
+    "Änderung für {}": "Change for {}",
+    "Läufe wiederhergestellt.": "Runs restored.",
+    "Leere Karte. Doppelklick auf die Fläche oder „+ Knoten“ wählen.": "Empty map. Double-click on the canvas or choose “+ Node”.",
+    "Name der neuen Karte:": "Name of the new map:",
+    "Name des Laufs:": "Name of the run:",
+    "Neue Karte": "New map",
+    "Neuer Name:": "New name:",
+    "Ohne Linie (Startwert 0, kein % möglich): ": "No line (start value 0, no % possible): ",
+    "Prozentuale Änderung je Knoten": "Percentage change per node",
+    "Runde": "Round",
+    "Runde {} / {}": "Round {} / {}",
+    "Schleife ({}): Ändert sich <b>{}</b> in einer Runde, z. B. Verdoppelung von {} auf {} ({}), kommt in der nächsten Runde noch einmal <b>{}</b> hinzu. Allgemein: zusätzliche Änderung = {} × Änderung der Vorrunde.": "Loop ({}): if <b>{}</b> changes in one round, e.g. doubling from {} to {} ({}), another <b>{}</b> is added in the next round. In general: additional change = {} × change of the previous round.",
+    "Selbstdämpfung": "Self-damping",
+    "Selbstverstärkung": "Self-reinforcing",
+    "Simulation: Etikett = Änderung seit Runde 0 in %, Zeiger auf Knoten = Wert, Startwert und Änderung, kräftigere Füllung = größere Änderung.": "Simulation: badge = change since round 0 in %, pointer on a node = value, start value and change, stronger fill = larger change.",
+    "Speichern fehlgeschlagen: ": "Saving failed: ",
+    "Start": "Source",
+    "Tippe auf eine freie Stelle, um einen Knoten anzulegen.": "Tap an empty spot to create a node.",
+    "Verdoppelt sich <b>{}</b> (von {} auf {}, also {}), ändert sich <b>{}</b> um <b>{}</b>. Allgemein: Änderung Ziel = {} × Änderung Start.": "If <b>{}</b> doubles (from {} to {}, i.e. {}), <b>{}</b> changes by <b>{}</b>. In general: change of target = {} × change of source.",
+    "Verlauf der Werte je Knoten": "Value history per node",
+    "Von einem Knoten zum Zielknoten ziehen – oder nacheinander Start und Ziel antippen. Schleife: Knoten zweimal antippen.": "Drag from a node to the target node – or tap source and target one after the other. Loop: tap a node twice.",
+    "Wert je Knoten": "Value per node",
+    "Ziel": "Target",
+    "absolut": "absolute",
+    "keine": "none",
+    "keine Datei": "no file",
+    "linear (alt)": "linear (old)",
+    "multiplikativ (alt)": "multiplicative (old)",
+    "ohne Anstoß": "no impulse",
+    "ohne Wirkung": "no effect",
+    "x-Achse: Runde · Linie berühren für Werte": "x-axis: round · touch a line for values",
+    "{} Eingabe(n) bei Knoten mit Wert 0 entfernt – dort ist keine Prozentangabe möglich.": "{} input(s) on nodes with value 0 removed – percentages are not possible there.",
+    "{} Kanten": "{} edges",
+    "{} Karten als Sicherung exportiert.": "{} maps exported as backup.",
+    "Änderung %": "Change %",
+    "Änderung absolut": "Change absolute",
+    "Änderung seit Runde 0": "Change since round 0",
+    "↻ Schleife ↻": "↻ Loop ↻",
+    "Radverkehr": "Cycling",
+    "Autoverkehr": "Car traffic",
+    "Luftqualität": "Air quality",
+    "Radwege-Ausbau": "Cycle lane expansion",
+    "Parkplatzangebot": "Parking supply",
+    "ÖPNV-Nutzung": "Public transport use",
+    "Lärmbelastung": "Noise pollution",
+}
+
+# Statische Texte aus index.html (data-i18n*-Schlüssel → Englisch).
+EN_STATIC = {
+    "clearAll": "Delete all",
+    "map": "Map",
+    "newMap": "New map",
+    "mapMenu": "Map …",
+    "rename": "Rename",
+    "duplicate": "Duplicate",
+    "addSample": "Add sample map",
+    "delete": "Delete",
+    "export": "Export",
+    "exportMap": "Current map (JSON)",
+    "exportAll": "All maps – backup (JSON)",
+    "exportRun": "Current run (CSV)",
+    "import": "Import",
+    "importPick": "Choose JSON file(s) …",
+    "importHint": "or drag a file into the window. Imported maps are added, nothing is overwritten.",
+    "help": "Help",
+    "helpTitle": "Help (?)",
+    "stage": "Map canvas",
+    "modeSelect": "Select",
+    "modeSelectT": "Select & move (V)",
+    "modeNode": "+ Node",
+    "modeNodeT": "Add node (N)",
+    "modeEdge": "+ Edge",
+    "modeEdgeT": "Draw edge (K / E)",
+    "zoomOut": "Zoom out",
+    "zoomIn": "Zoom in",
+    "fit": "Fit",
+    "fitT": "Fit view",
+    "sizeByValue": "Size by value",
+    "full": "Full screen",
+    "fullT": "Map view fills the screen (M)",
+    "nodeText": "Node text",
+    "toStart": "To start",
+    "round": "Round",
+    "close": "Close",
+    "splitter": "Sidebar width",
+    "splitterT": "Drag to change the width · double-click: default width",
+    "tabEdit": "Edit",
+    "tabRuns": "Runs",
+    "nodesOfMap": "Nodes of the map",
+    "rounds": "Rounds",
+    "damping": "Damping per round",
+    "dampingT": "Every transmission over an edge is multiplied by this value (1 = no weakening, 0.8 = −20% per step). More in the help.",
+    "runName": "Name of the run",
+    "auto": "automatic",
+    "impulse": "Impulse: change per node",
+    "unitAs": "Specify as",
+    "percent": "Percent",
+    "absValue": "absolute value",
+    "node": "Node",
+    "value": "Value",
+    "result": "Result",
+    "simRun": "Run simulation",
+    "simReset": "Clear changes",
+    "savedRuns": "Saved runs",
+    "helpHead": "fuzzymap – Quick guide",
+    "helpClose": "Close help",
+    "dropHint": "Drop the file to import it",
+}
+
+
+def init_lang():
+    """Sprache vor dem Laden: Browsersprache (de* = Deutsch, sonst Englisch); gespeicherte Wahl hat Vorrang (load)."""
+    try:
+        nav = str(window.navigator.language or "de").lower()
+    except Exception:
+        nav = "de"
+    LANG["v"] = "de" if nav.startswith("de") else "en"
+
+
+def apply_static():
+    """Übersetzt die statischen Texte in index.html (data-i18n*, Hilfe aus <template id="help-en">)."""
+    document.documentElement.lang = LANG["v"]
+    for attr_name, store in (("data-i18n", "innerHTML"), ("data-i18n-title", "title"),
+                             ("data-i18n-aria", "aria-label"), ("data-i18n-ph", "placeholder")):
+        els = document.querySelectorAll("[" + attr_name + "]")
+        for i in range(els.length):
+            e = els.item(i)
+            key = str(e.getAttribute(attr_name))
+            orig = "data-de-" + store
+            if not e.hasAttribute(orig):
+                e.setAttribute(orig, e.innerHTML if store == "innerHTML" else (e.getAttribute(store) or ""))
+            de = str(e.getAttribute(orig))
+            val = EN_STATIC.get(key, de) if is_en() else de
+            if store == "innerHTML":
+                e.innerHTML = val
+            else:
+                e.setAttribute(store, val)
+    hb = document.querySelector("#help .help-body")
+    tpl = el("help-en")
+    if not is_none(hb) and not is_none(tpl):
+        if not hb.hasAttribute("data-de-ready"):
+            HELP_DE["html"] = str(hb.innerHTML)
+            hb.setAttribute("data-de-ready", "1")
+        hb.innerHTML = str(tpl.innerHTML) if is_en() else HELP_DE["html"]
+    btns = document.querySelectorAll("[data-action=lang]")
+    for i in range(btns.length):
+        b = btns.item(i)
+        b.setAttribute("aria-pressed", "true" if attr(b, "data-v") == LANG["v"] else "false")
+
+
+HELP_DE = {"html": ""}
+
+
+def a_lang(b, e):
+    v = attr(b, "data-v")
+    if v not in ("de", "en") or v == LANG["v"]:
+        return
+    LANG["v"] = v
+    S["settings"]["lang"] = v
+    save()
+    apply_static()
+    render_all()
+    render_hint()
+
+
+ACTIONS["lang"] = a_lang
+
+
+def main():
+    init_lang()
+    load()
+    apply_static()
+    svg = el("canvas")
+    listen(svg, "pointerdown", on_down)
+    listen(svg, "pointermove", on_move)
+    listen(svg, "pointerup", on_up)
+    listen(svg, "pointercancel", on_up)
+    listen(svg, "dblclick", on_dbl)
+    listen(svg, "wheel", on_wheel, {"passive": False})
+    listen(document, "click", on_click)
+    listen(document, "input", on_input)
+    listen(document, "change", on_change)
+    # ausstehendes Speichern nicht verlieren: visibilitychange feuert auch beim Schließen bzw. Wechseln des Tabs
+    listen(document, "visibilitychange", flush_save)
+    listen(document, "keydown", on_key)
+    listen(document, "fullscreenchange", on_fs_change)
+    listen(document, "webkitfullscreenchange", on_fs_change)
+    listen(document, "fullscreenerror", _fs_denied)
+    listen(document, "pointerover", on_over)
+    listen(document, "pointerout", on_out)
+    listen(el("run-detail"), "pointermove", on_chart_move)
+    listen(el("run-detail"), "pointerleave", on_chart_leave)
+    listen(document, "pointerdown", on_chart_down)
+    sp = el("splitter")
+    listen(sp, "pointerdown", on_split_down)
+    listen(sp, "pointermove", on_split_move)
+    listen(sp, "pointerup", on_split_up)
+    listen(sp, "pointercancel", on_split_up)
+    listen(sp, "keydown", on_split_key)
+    listen(sp, "dblclick", on_split_dbl)
+    if S["settings"].get("panelW"):
+        set_panel_w(S["settings"]["panelW"])
+    listen(el("import-file"), "change", on_import)
+    listen(document, "dragover", on_dragover)
+    listen(document, "dragleave", on_dragleave)
+    listen(document, "drop", on_drop)
+    ro = window.ResizeObserver.new(RESIZE)
+    ro.observe(el("canvas"))
+    ro2 = window.ResizeObserver.new(PANEL_RESIZE)
+    ro2.observe(el("run-detail"))
+    render_all()
+    fit()
+    ld = el("loader")
+    if not is_none(ld):
+        ld.remove()
+    try:
+        if not is_none(window.navigator.serviceWorker):
+            window.navigator.serviceWorker.register("sw.js")
+    except Exception:
+        pass
+
+
+try:
+    main()
+except Exception as ex:
+    import sys, io
+    buf = io.StringIO()
+    sys.print_exception(ex, buf)
+    document.body.setAttribute("data-err", buf.getvalue())
+    raise

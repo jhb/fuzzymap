@@ -1,0 +1,381 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later – Copyright (C) 2026 die Autorinnen und Autoren von fuzzymap.
+     Entstanden per Vibe Coding; Lizenztext: LICENSE, Quellcode: https://github.com/jhb/fuzzymap -->
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>fuzzymap – Fuzzy Cognitive Maps</title>
+  <meta name="description" content="Fuzzy Cognitive Maps erstellen, speichern und rundenweise simulieren.">
+  <meta name="theme-color" content="#f6f4ef" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#161513" media="(prefers-color-scheme: dark)">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="fuzzymap">
+  <!-- Alle Laufzeitdateien werden lokal ausgeliefert (vendor/), keine Anfragen an fremde Server. -->
+  <link rel="stylesheet" href="vendor/fonts/fonts.css">
+  <link rel="stylesheet" href="vendor/pyscript/core.css">
+  <script type="module" src="vendor/pyscript/core.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="loader" role="status">
+    <svg class="logo spin" viewBox="0 0 32 32" aria-hidden="true"><use href="#logo"/></svg>
+    <p id="loader-text">Python wird geladen …</p>
+  </div>
+  <script>
+    // Einziges Inline-JS: Ladehinweis in der richtigen Sprache, bevor Python läuft.
+    (function () {
+      var lang = (navigator.language || "de").toLowerCase().indexOf("de") === 0 ? "de" : "en";
+      try { var d = JSON.parse(localStorage.getItem("fcm.maps.v1") || "null"); if (d && d.settings && d.settings.lang) lang = d.settings.lang; } catch (e) {}
+      document.documentElement.lang = lang;
+      if (lang === "en") document.getElementById("loader-text").textContent = "Loading Python …";
+      // Update: Lief schon eine ältere Version (Seite wird von einem Service Worker gesteuert) und übernimmt ein
+      // neuer Service Worker, einmal neu laden – sonst sieht man die neue Version erst beim übernächsten Öffnen.
+      if ("serviceWorker" in navigator && navigator.serviceWorker.controller) {
+        var reloaded = false;
+        navigator.serviceWorker.addEventListener("controllerchange", function () {
+          if (!reloaded) { reloaded = true; location.reload(); }
+        });
+      }
+    })();
+  </script>
+
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="logo" viewBox="0 0 32 32">
+      <path d="M9 9 L23 12 M9 9 L13 23 M23 12 L13 23" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>
+      <circle cx="9" cy="9" r="4.5" fill="var(--accent, #0f6e6e)"/>
+      <circle cx="23" cy="12" r="3.5" fill="currentColor"/>
+      <circle cx="13" cy="23" r="3.5" fill="none" stroke="currentColor" stroke-width="2"/>
+    </symbol>
+  </svg>
+
+  <header class="bar">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 32 32" aria-label="fuzzymap Logo"><use href="#logo"/></svg>
+      <span>fuzzymap</span>
+    </div>
+    <label class="map-pick">
+      <span class="sr-only" data-i18n="map">Karte</span>
+      <select id="map-select"></select>
+    </label>
+    <button data-action="map-new" data-i18n="newMap">Neue Karte</button>
+    <details class="menu" id="map-menu">
+      <summary data-i18n="mapMenu">Karte …</summary>
+      <div class="menu-pop">
+        <button data-action="map-rename" data-i18n="rename">Umbenennen</button>
+        <button data-action="map-dup" data-i18n="duplicate">Duplizieren</button>
+        <button data-action="map-sample" data-i18n="addSample">Beispielkarte hinzufügen</button>
+        <button data-action="map-delete" class="danger" data-i18n="delete">Löschen</button>
+      </div>
+    </details>
+    <details class="menu" id="io-menu">
+      <summary>Export / Import</summary>
+      <div class="menu-pop">
+        <span class="menu-label" data-i18n="export">Exportieren</span>
+        <button data-action="export-map" data-i18n="exportMap">Aktuelle Karte (JSON)</button>
+        <button data-action="export-all" data-i18n="exportAll">Alle Karten – Sicherung (JSON)</button>
+        <button data-action="export-run-csv" data-i18n="exportRun">Aktuellen Lauf (CSV)</button>
+        <span class="menu-label" data-i18n="import">Importieren</span>
+        <button data-action="import" data-i18n="importPick">JSON-Datei(en) auswählen …</button>
+        <span class="menu-hint" data-i18n="importHint">oder Datei ins Fenster ziehen. Importierte Karten werden ergänzt, nichts wird überschrieben.</span>
+      </div>
+    </details>
+    <div class="seg lang-seg" role="group" aria-label="Sprache / Language">
+      <button data-action="lang" data-v="de" aria-pressed="true" lang="de" title="Deutsch">DE</button>
+      <button data-action="lang" data-v="en" aria-pressed="false" lang="en" title="English">EN</button>
+    </div>
+    <button data-action="help" title="Hilfe (?)" data-i18n="help" data-i18n-title="helpTitle">Hilfe</button>
+  </header>
+
+  <main class="layout">
+    <section class="stage" aria-label="Kartenfläche" data-i18n-aria="stage">
+      <div class="toolbar" role="toolbar">
+        <div class="seg" id="modes">
+          <button data-action="mode" data-mode="select" aria-pressed="true" title="Auswählen &amp; verschieben (V)" data-i18n="modeSelect" data-i18n-title="modeSelectT">Auswählen</button>
+          <button data-action="mode" data-mode="node" title="Knoten hinzufügen (N)" data-i18n="modeNode" data-i18n-title="modeNodeT">+ Knoten</button>
+          <button data-action="mode" data-mode="edge" title="Kante ziehen (K)" data-i18n="modeEdge" data-i18n-title="modeEdgeT">+ Kante</button>
+        </div>
+        <div class="seg">
+          <button data-action="zoom-out" title="Verkleinern" aria-label="Verkleinern" data-i18n-title="zoomOut" data-i18n-aria="zoomOut">−</button>
+          <button data-action="zoom-in" title="Vergrößern" aria-label="Vergrößern" data-i18n-title="zoomIn" data-i18n-aria="zoomIn">+</button>
+          <button data-action="fit" title="Ansicht einpassen" data-i18n="fit" data-i18n-title="fitT">Einpassen</button>
+        </div>
+        <div class="seg">
+          <button data-action="toggle-size" id="size-toggle" class="switch" aria-pressed="false" role="switch">
+            <span class="knob" aria-hidden="true"></span><span data-i18n="sizeByValue">Größe nach Wert</span>
+          </button>
+        </div>
+        <div class="seg seg-end">
+          <button data-action="fullmap" id="full-toggle" aria-pressed="false" title="Kartenansicht bildschirmfüllend (M)"
+                  data-i18n-title="fullT"><span class="full-ico" aria-hidden="true">⛶</span> <span data-i18n="full">Vollbild</span></button>
+        </div>
+      </div>
+      <svg id="canvas" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none"></svg>
+      <p class="hint" id="hint"></p>
+      <div class="node-tip" id="node-tip" hidden></div>
+      <input type="text" id="node-edit" class="node-edit" hidden autocomplete="off" spellcheck="false"
+             aria-label="Text des Knotens" data-i18n-aria="nodeText" maxlength="200">
+
+      <div class="playback" id="playback" hidden>
+        <button data-action="pb-first" aria-label="Zum Start" data-i18n-aria="toStart">⏮</button>
+        <button data-action="pb-play" id="pb-play" class="primary">Abspielen</button>
+        <input type="range" id="pb-range" min="0" max="10" value="0" aria-label="Runde" data-i18n-aria="round">
+        <output id="pb-label">Runde 0</output>
+        <button data-action="sim-close" data-i18n="close">Schließen</button>
+      </div>
+    </section>
+
+    <div class="splitter" id="splitter" role="separator" aria-orientation="vertical" tabindex="0"
+         aria-label="Breite der Seitenleiste" data-i18n-aria="splitter" aria-valuemin="300" aria-valuemax="900" aria-valuenow="400"
+         title="Ziehen zum Ändern der Breite · Doppelklick: Standardbreite" data-i18n-title="splitterT"></div>
+
+    <aside class="panel">
+      <nav class="tabs" role="tablist">
+        <button role="tab" data-action="tab" data-tab="edit" aria-selected="true" data-i18n="tabEdit">Bearbeiten</button>
+        <button role="tab" data-action="tab" data-tab="sim" aria-selected="false">Simulation</button>
+        <button role="tab" data-action="tab" data-tab="runs" aria-selected="false"><span data-i18n="tabRuns">Läufe</span> <span id="runs-count" class="count">0</span></button>
+      </nav>
+
+      <div class="tab" id="tab-edit">
+        <div id="inspector"></div>
+        <h3 data-i18n="nodesOfMap">Knoten der Karte</h3>
+        <ul id="node-list" class="list"></ul>
+      </div>
+
+      <div class="tab" id="tab-sim" hidden>
+        <form id="sim-form" onsubmit="return false">
+          <div class="grid2">
+            <label><span data-i18n="rounds">Runden</span>
+              <input type="number" id="sim-rounds" min="1" max="200" step="1" value="12">
+            </label>
+            <label><span data-i18n="damping">Dämpfung pro Runde</span>
+              <input type="number" id="sim-damping" min="0" max="1" step="0.05" value="1"
+                     data-i18n-title="dampingT" title="Jede Weitergabe über eine Kante wird mit diesem Wert multipliziert (1 = keine Abschwächung, 0,8 = −20 % je Schritt). Mehr in der Hilfe.">
+            </label>
+            <label><span data-i18n="runName">Name des Laufs</span>
+              <input type="text" id="sim-name" placeholder="automatisch" data-i18n-ph="auto">
+            </label>
+          </div>
+          <p class="note" id="model-note"></p>
+          <h3 data-i18n="impulse">Anstoß: Änderung pro Knoten</h3>
+          <fieldset class="unit-seg">
+            <legend data-i18n="unitAs">Angabe als</legend>
+            <label><input type="radio" name="unit" id="unit-pct" value="pct" checked> <span data-i18n="percent">Prozent</span></label>
+            <label><input type="radio" name="unit" id="unit-abs" value="abs"> <span data-i18n="absValue">absoluter Wert</span></label>
+          </fieldset>
+          <p class="note" id="unit-note"></p>
+          <table class="changes">
+            <colgroup><col><col class="c-val"><col class="c-chg"><col class="c-res"></colgroup>
+            <thead><tr><th data-i18n="node">Knoten</th><th data-i18n="value">Wert</th><th id="chg-head">Änderung %</th><th data-i18n="result">Ergebnis</th></tr></thead>
+            <tbody id="changes-body"></tbody>
+          </table>
+          <div class="row">
+            <button type="button" class="primary" data-action="sim-run" data-i18n="simRun">Simulation starten</button>
+            <button type="button" data-action="sim-reset" data-i18n="simReset">Änderungen leeren</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="tab" id="tab-runs" hidden>
+        <div id="run-detail"></div>
+        <div class="runs-head">
+          <h3 data-i18n="savedRuns">Gespeicherte Läufe</h3>
+          <button class="small danger" id="runs-clear" data-action="runs-clear" data-i18n="clearAll" hidden>Alle löschen</button>
+        </div>
+        <ul id="run-list" class="list"></ul>
+      </div>
+    </aside>
+  </main>
+
+
+  <dialog id="help" aria-labelledby="help-title">
+    <form method="dialog" class="help-head">
+      <h2 id="help-title" data-i18n="helpHead">fuzzymap – Kurzanleitung</h2>
+      <button value="close" aria-label="Hilfe schließen" data-i18n="close" data-i18n-aria="helpClose">Schließen</button>
+    </form>
+    <div class="help-body">
+      <section class="help-intro">
+        <p>Eine <b>Fuzzy Cognitive Map</b> zeigt, wie Faktoren eines Systems einander beeinflussen: Knoten sind Größen
+          wie „Radverkehr“ oder „Luftqualität“, Pfeile sind Wirkungen – verstärkend oder abschwächend, unterschiedlich stark.</p>
+        <p>Mit fuzzymap zeichnest du solche Karten, stößt einzelne Faktoren an und verfolgst Runde für Runde, wie sich die
+          Wirkung durch das Netz ausbreitet. Das Ergebnis ist keine exakte Prognose, sondern hilft, Annahmen,
+          Rückkopplungen und Fernwirkungen sichtbar zu machen.</p>
+      </section>
+      <section>
+        <h3>Karte bauen</h3>
+        <ul>
+          <li><b>Knoten anlegen:</b> Modus „+ Knoten“ und auf die Fläche tippen – oder Doppelklick im Modus „Auswählen“. Das Textfeld öffnet sich direkt auf der Karte.</li>
+          <li><b>Text ändern:</b> Doppelklick bzw. Doppeltippen auf einen Knoten oder <kbd>Enter</kbd>/<kbd>F2</kbd> beim ausgewählten Knoten. <kbd>Enter</kbd> oder Klick daneben übernimmt, <kbd>Esc</kbd> verwirft.</li>
+          <li><b>Kante anlegen:</b> Modus „+ Kante“, vom Start- zum Zielknoten ziehen oder beide nacheinander antippen.</li>
+          <li><b>Schleife:</b> Im Modus „+ Kante“ einen Knoten zweimal antippen (oder hinaus- und zurückziehen) – oder im Inspektor „Schleife auf sich selbst“. Der Knoten wirkt dann in der nächsten Runde auf sich selbst zurück.</li>
+          <li><b>Bearbeiten:</b> Knoten oder Kante anklicken, dann im Tab „Bearbeiten“ Text, Wert oder Faktor ändern.</li>
+          <li><b>Beschreibung:</b> Knoten und Kanten können zusätzlich eine Beschreibung haben. Beim Darüberfahren (Touch: antippen) zeigt eine Anzeige immer Text und Wert bzw. Start → Ziel und Faktor, darunter die Beschreibung; ein kleiner Punkt zeigt, wo es eine gibt.</li>
+          <li><b>Ansicht:</b> Fläche ziehen verschiebt, Mausrad oder zwei Finger zoomen, „Einpassen“ zeigt alles.</li>
+        </ul>
+      </section>
+      <section>
+        <h3>Bedeutung des Faktors</h3>
+        <p>Der Faktor (−10 bis +10, Standard 0,5) gibt an, welcher Anteil der <b>absoluten Änderung</b> des Startknotens beim Zielknoten ankommt.</p>
+        <p class="help-example">Start = 50 verdoppelt sich (+50) → Faktor 1,0: Ziel +50 · Faktor 0,5: Ziel +25 · Faktor −2: Ziel −100</p>
+      </section>
+      <section>
+        <h3>Simulieren</h3>
+        <ol>
+          <li>Tab „Simulation“: Runden und Dämpfung wählen.</li>
+          <li>Beim Anstoß „Prozent“ oder „absoluter Wert“ wählen und für einzelne Knoten eine Änderung eintragen (Prozent: +100 = verdoppeln; absolut: +25 addiert 25). Die Spalte „Ergebnis“ zeigt den neuen Wert.</li>
+          <li>„Simulation starten“ – der Lauf wird gespeichert und abgespielt.</li>
+        </ol>
+        <p>Runde 0 = Ausgangszustand, Runde 1 = Anstoß. Danach gibt jeder Knoten pro Runde nur die Änderung der Vorrunde weiter; mehrere Eingänge addieren sich.
+          In Rückkopplungsschleifen kann sich die Wirkung aufschaukeln – dann hilft eine Dämpfung unter 1.</p>
+      </section>
+      <section>
+        <h3>Dämpfung</h3>
+        <p>Die Dämpfung <b>d</b> (0 bis 1) schwächt jede Weitergabe einer Änderung ab: Was über eine Kante beim Zielknoten
+          ankommt, wird zusätzlich mit d multipliziert – in jeder Runde aufs Neue. Der Anstoß in Runde 1 selbst bleibt ungedämpft.</p>
+        <ul>
+          <li><b>d = 1</b> (Standard): keine Abschwächung, die Wirkung kommt in voller Höhe an.</li>
+          <li><b>d = 0,8</b>: jede Weitergabe verliert 20 %. Je weiter ein Knoten vom Anstoß entfernt ist, desto schwächer die Wirkung.</li>
+          <li><b>d = 0</b>: nur der Anstoß zählt, nichts wird weitergegeben.</li>
+        </ul>
+        <p class="help-example">Kette A → B → C, Faktoren 1,0, Anstoß A +100:
+          ohne Dämpfung B +100, C +100 · mit d = 0,8 B +80 (Runde 2), C +64 (Runde 3)</p>
+        <p class="help-example">Schleife an A (Startwert 100) mit Faktor 1,0, Anstoß +100:
+          ohne Dämpfung wächst A jede Runde um weitere 100, ohne Ende · mit d = 0,8 kommen +80, +64, +51,2 … hinzu,
+          A nähert sich 100 + 500 = 600 an</p>
+        <p>Faustregel: Eine Rückkopplung kommt zur Ruhe, wenn <b>d × Produkt der Faktoren im Kreis</b> betragsmäßig unter 1 liegt.
+          Die Dämpfung ist damit der Regler, mit dem sich aufschaukelnde Kreise bändigen lassen – und gleichzeitig ein Modell
+          dafür, dass Wirkungen über viele Zwischenschritte an Kraft verlieren.</p>
+      </section>
+      <section>
+        <h3>Lesen der Darstellung</h3>
+        <ul>
+          <li><b>Knotenfarbe</b> = Farbe der Linie im Diagramm und in den Listen.</li>
+          <li><b>Kanten:</b> grün = verstärkend, rot gestrichelt = abschwächend, Dicke = Stärke.</li>
+          <li><b>In der Simulation:</b> Etikett = Änderung seit Runde 0 in Prozent (bei Startwert 0 absolut); Zeiger auf einen Knoten zeigt Wert, Startwert und Änderung absolut und in Prozent (z. B. „+50 / +75 %“); kräftigere Füllung = größere Änderung, animierte Kante = Wirkung fließt gerade.</li>
+          <li><b>Diagramm:</b> Schalter „Absolut / Änderung %“ wählt die y-Achse: Wert des Knotens oder Änderung gegenüber Runde 0 in Prozent. Zeigt die Maus auf eine Linie, erscheinen Runde, Wert und Änderung an dieser Stelle. Auf Touch-Geräten antippen und waagerecht ziehen.</li>
+          <li><b>Hovern</b> über Knoten, Diagrammlinie oder Listenzeile hebt den Knoten überall hervor.</li>
+          <li><b>„Größe nach Wert“</b>: Auf der Karte ist der kleinste Wert (auch ein negativer) der kleinste Knoten, der größte der größte. In der Simulation zeigt die Größe die Änderung gegenüber dem Startwert: unverändert = Normalgröße, gestiegen = größer, gefallen = kleiner.</li>
+          <li><b>Breite der Seitenleiste:</b> Trenner zwischen Karte und Seitenleiste ziehen, Doppelklick = Standardbreite.</li>
+          <li><b>Sprache:</b> „DE / EN“ in der Kopfleiste stellt die ganze Oberfläche um; deine Karten behalten ihre Texte.</li>
+        </ul>
+      </section>
+      <section>
+        <h3>Daten</h3>
+        <p>Alles wird automatisch im Browser gespeichert – nur auf diesem Gerät. Für Sicherungen und andere Geräte: Menü „Export / Import“ (Karte oder alle Karten als JSON, Lauf als CSV). Importieren ergänzt immer, nichts wird überschrieben. Die Beispielkarte mit erklärenden Beschreibungen lässt sich jederzeit über „Karte …“ → „Beispielkarte hinzufügen“ neu anlegen.</p>
+      </section>
+      <section>
+        <h3>Tastenkürzel</h3>
+        <table class="keys">
+          <tr><td><kbd>V</kbd></td><td>Auswählen</td><td><kbd>F</kbd></td><td>Einpassen</td></tr>
+          <tr><td><kbd>N</kbd></td><td>Knoten hinzufügen</td><td><kbd>G</kbd></td><td>Größe nach Wert</td></tr>
+          <tr><td><kbd>K</kbd> / <kbd>E</kbd></td><td>Kante hinzufügen</td><td><kbd>Leertaste</kbd></td><td>Abspielen / Pause</td></tr>
+          <tr><td><kbd>Enter</kbd> / <kbd>F2</kbd></td><td colspan="3">Text des ausgewählten Knotens auf der Karte bearbeiten</td></tr>
+          <tr><td><kbd>Entf</kbd></td><td>Auswahl löschen</td><td><kbd>Esc</kbd></td><td>Auswahl aufheben</td></tr>
+          <tr><td><kbd>?</kbd></td><td>Diese Hilfe</td><td><kbd>M</kbd></td><td>Vollbild an / aus</td></tr>
+        </table>
+      </section>
+      <section>
+        <h3>Über fuzzymap</h3>
+        <p>fuzzymap ist vollständig durch <b>Vibe Coding</b> entstanden: Code, Texte und Dokumentation wurden im Dialog mit einer KI (Perplexity Computer) erzeugt; der Mensch hat Anforderungen formuliert, getestet und Rückmeldungen gegeben. Getestet, aber nicht systematisch geprüft – bitte kritisch verwenden.</p>
+        <p>Freie Software unter der <a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noopener">GNU Affero General Public License v3.0 oder später</a> (Lizenztext auch in der Datei LICENSE), ohne jede Gewährleistung. Quellcode: <a href="https://github.com/jhb/fuzzymap" target="_blank" rel="noopener">github.com/jhb/fuzzymap</a>. Mitgelieferte Komponenten: PyScript (Apache 2.0), MicroPython (MIT), Schrift Plus Jakarta Sans (SIL OFL 1.1).</p>
+      </section>
+    </div>
+  </dialog>
+  <!-- Englische Hilfe; wird beim Umschalten auf EN in .help-body eingesetzt (main.mpy: apply_static). -->
+  <template id="help-en">
+      <section class="help-intro">
+        <p>A <b>fuzzy cognitive map</b> shows how the factors of a system influence each other: nodes are quantities
+          such as “Cycling” or “Air quality”, arrows are effects – reinforcing or weakening, of varying strength.</p>
+        <p>With fuzzymap you draw such maps, give individual factors an impulse and follow round by round how the effect
+          spreads through the network. The result is not an exact forecast; it helps to make assumptions,
+          feedback loops and indirect effects visible.</p>
+      </section>
+      <section>
+        <h3>Building a map</h3>
+        <ul>
+          <li><b>Add a node:</b> “+ Node” mode and tap the canvas – or double-click in “Select” mode. The text field opens right on the map.</li>
+          <li><b>Edit text:</b> double-click or double-tap a node, or press <kbd>Enter</kbd>/<kbd>F2</kbd> on the selected node. <kbd>Enter</kbd> or a click elsewhere applies, <kbd>Esc</kbd> discards.</li>
+          <li><b>Add an edge:</b> “+ Edge” mode, drag from the source to the target node or tap both one after the other.</li>
+          <li><b>Loop:</b> in “+ Edge” mode tap a node twice (or drag out and back) – or use “Loop to itself” in the inspector. The node then feeds back on itself in the next round.</li>
+          <li><b>Edit:</b> click a node or edge, then change text, value or factor in the “Edit” tab.</li>
+          <li><b>Description:</b> nodes and edges can also have a description. Hovering (touch: tap) always shows text and value or source → target and factor, with the description below; a small dot shows where there is one.</li>
+          <li><b>View:</b> drag the canvas to pan, mouse wheel or two fingers to zoom, “Fit” shows everything.</li>
+        </ul>
+      </section>
+      <section>
+        <h3>What the factor means</h3>
+        <p>The factor (−10 to +10, default 0.5) states which share of the <b>absolute change</b> of the source node arrives at the target node.</p>
+        <p class="help-example">Source = 50 doubles (+50) → factor 1.0: target +50 · factor 0.5: target +25 · factor −2: target −100</p>
+      </section>
+      <section>
+        <h3>Simulating</h3>
+        <ol>
+          <li>“Simulation” tab: choose rounds and damping.</li>
+          <li>For the impulse choose “Percent” or “absolute value” and enter a change for individual nodes (percent: +100 = double; absolute: +25 adds 25). The “Result” column shows the new value.</li>
+          <li>“Run simulation” – the run is saved and played back.</li>
+        </ol>
+        <p>Round 0 = initial state, round 1 = impulse. After that every node passes on only the change of the previous round; several inputs add up.
+          In feedback loops the effect can build up – a damping below 1 helps.</p>
+      </section>
+      <section>
+        <h3>Damping</h3>
+        <p>The damping <b>d</b> (0 to 1) weakens every transmission of a change: whatever arrives at a target node via an edge
+          is additionally multiplied by d – again in every round. The impulse in round 1 itself is not damped.</p>
+        <ul>
+          <li><b>d = 1</b> (default): no weakening, the effect arrives in full.</li>
+          <li><b>d = 0.8</b>: every transmission loses 20%. The further a node is from the impulse, the weaker the effect.</li>
+          <li><b>d = 0</b>: only the impulse counts, nothing is passed on.</li>
+        </ul>
+        <p class="help-example">Chain A → B → C, factors 1.0, impulse A +100:
+          without damping B +100, C +100 · with d = 0.8 B +80 (round 2), C +64 (round 3)</p>
+        <p class="help-example">Loop at A (start value 100) with factor 1.0, impulse +100:
+          without damping A grows by another 100 every round, forever · with d = 0.8 it gains +80, +64, +51.2 …,
+          A approaches 100 + 500 = 600</p>
+        <p>Rule of thumb: a feedback loop settles when <b>d × product of the factors around the loop</b> is below 1 in absolute value.
+          Damping is therefore the control that tames loops that build up – and at the same time a model
+          for effects losing strength over many intermediate steps.</p>
+      </section>
+      <section>
+        <h3>Reading the display</h3>
+        <ul>
+          <li><b>Node colour</b> = colour of its line in the chart and in the lists.</li>
+          <li><b>Edges:</b> green = reinforcing, red dashed = weakening, thickness = strength.</li>
+          <li><b>During simulation:</b> badge = change since round 0 in percent (absolute if the start value is 0); pointing at a node shows value, start value and change, absolute and in percent (e.g. “+50 / +75%”); stronger fill = larger change, animated edge = effect currently flowing.</li>
+          <li><b>Chart:</b> the “Absolute / Change %” switch selects the y-axis: node value or change relative to round 0 in percent. Pointing at a line shows round, value and change at that position. On touch devices tap and drag horizontally.</li>
+          <li><b>Hovering</b> over a node, chart line or list row highlights the node everywhere.</li>
+          <li><b>“Size by value”</b>: on the map the smallest value (even a negative one) is the smallest node and the largest value the largest. During a simulation the size shows the change relative to the start value: unchanged = normal size, increased = larger, decreased = smaller.</li>
+          <li><b>Sidebar width:</b> drag the divider between map and sidebar, double-click = default width.</li>
+          <li><b>Language:</b> “DE / EN” in the header switches the whole interface; your maps keep their texts.</li>
+        </ul>
+      </section>
+      <section>
+        <h3>Data</h3>
+        <p>Everything is saved automatically in the browser – on this device only. For backups and other devices: menu “Export / Import” (map or all maps as JSON, run as CSV). Importing always adds, nothing is overwritten. The sample map with explanatory descriptions can be added again at any time via “Map …” → “Add sample map”.</p>
+      </section>
+      <section>
+        <h3>Keyboard shortcuts</h3>
+        <table class="keys">
+          <tr><td><kbd>V</kbd></td><td>Select</td><td><kbd>F</kbd></td><td>Fit</td></tr>
+          <tr><td><kbd>N</kbd></td><td>Add node</td><td><kbd>G</kbd></td><td>Size by value</td></tr>
+          <tr><td><kbd>K</kbd> / <kbd>E</kbd></td><td>Add edge</td><td><kbd>Space</kbd></td><td>Play / pause</td></tr>
+          <tr><td><kbd>Enter</kbd> / <kbd>F2</kbd></td><td colspan="3">Edit the text of the selected node on the map</td></tr>
+          <tr><td><kbd>Delete</kbd></td><td>Delete selection</td><td><kbd>Esc</kbd></td><td>Clear selection</td></tr>
+          <tr><td><kbd>?</kbd></td><td>This help</td><td><kbd>M</kbd></td><td>Full screen on / off</td></tr>
+        </table>
+      </section>
+      <section>
+        <h3>About fuzzymap</h3>
+        <p>fuzzymap was created entirely through <b>vibe coding</b>: code, texts and documentation were generated in a dialogue with an AI (Perplexity Computer); the human wrote the requirements, tested and gave feedback. Tested, but not systematically reviewed – please use with care.</p>
+        <p>Free software under the <a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noopener">GNU Affero General Public License v3.0 or later</a> (licence text also in the file LICENSE), without any warranty. Source code: <a href="https://github.com/jhb/fuzzymap" target="_blank" rel="noopener">github.com/jhb/fuzzymap</a>. Bundled components: PyScript (Apache 2.0), MicroPython (MIT), Plus Jakarta Sans font (SIL OFL 1.1).</p>
+      </section>
+  </template>
+  <input type="file" id="import-file" accept="application/json,.json" multiple hidden>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <div id="drop-hint" aria-hidden="true" data-i18n="dropHint">Datei loslassen, um sie zu importieren</div>
+  <script type="mpy" src="main.mpy" config='{"interpreter": "./vendor/micropython/micropython.mjs"}'></script>
+</body>
+</html>
