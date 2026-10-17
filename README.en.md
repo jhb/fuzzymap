@@ -292,6 +292,7 @@ Menu **Export / Import**:
 | Function | Result |
 |---|---|
 | *Current map (JSON)* | `mapname.fuzzymap.json` – nodes, edges, simulation settings, all runs |
+| *Current map (SVG)* | `mapname.svg` – image of the map as shown (with an open run the round shown: `mapname-round-N.svg`). Opened in a browser, the hover display keeps working: pointing at a node or edge shows text, value or factor and description and dims the rest – without script, CSS only. In graphics programs and embedded as `<img>` the image is static |
 | *All maps – backup (JSON)* | `fuzzymap-backup-YYYY-MM-DD.json` – all maps |
 | *Current run (CSV)* | Table of values per round and node plus edge list; English: comma and decimal point, German: semicolon and decimal comma (each suitable for Excel) |
 | *Choose JSON file(s) …* | Import one or more files – or simply drag files into the window |
@@ -365,7 +366,7 @@ Bundled components (details in [`vendor/LIZENZEN.md`](vendor/LIZENZEN.md)):
   Despite its extension, `main.mpy` is ordinary Python source (not precompiled MicroPython bytecode); configure your
   editor to treat `.mpy` as Python. Syntax check: `python3 -c "compile(open('main.mpy').read(), 'main.mpy', 'exec')"`.
 - **Cache:** the service worker serves files from the cache first (*stale-while-revalidate*). After changes either
-  increase the `CACHE` constant in `sw.js` (e.g. from `fuzzymap-v45` to `fuzzymap-v46`) or, during development,
+  increase the `CACHE` constant in `sw.js` (e.g. from `fuzzymap-v46` to `fuzzymap-v47`) or, during development,
   enable *Application → Service Workers → Bypass for network* in the browser DevTools.
 - **Debugging:** Python errors at start-up are written to the browser console and additionally stored as the
   attribute `data-err` on `<body>`.

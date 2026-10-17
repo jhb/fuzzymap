@@ -131,6 +131,22 @@ A saved simulation run is a **snapshot** – it stays valid even if the map is c
   characters.
 - Runs without `history` or `nodes` are dropped; missing metadata is filled in.
 
+## SVG export of a map
+
+*Export / Import → Current map (SVG)* creates a standalone SVG file (UTF-8) of the map as currently shown – with an
+open run, with the values and labels of the round shown. Selection and highlighting are not included. Structure:
+
+- `<title>` = map name, `<desc>` = note about fuzzymap
+- `<style>` with fixed colours (light scheme, no CSS variables or `color-mix`, so graphics programs show the colours
+  too)
+- `<g class="map">` with arrowheads, edges, factor labels and nodes (same classes and `data-*` attributes as in the
+  app), followed by a hidden `<foreignObject class="tip" data-for="ID">` per node and edge holding the hover display as
+  XHTML
+
+The hover display needs no script: `.node[data-hl="ID"]:hover ~ .tip[data-for="ID"]` shows the box, dimming the other
+elements uses `:has()`. This works when the file is opened directly in a browser or embedded via `<object>`/inline; as
+`<img>` or in graphics programs the image is static.
+
 ## CSV export of a run
 
 File `mapname-runname.csv`, UTF-8 with BOM, CRLF line endings. The format follows the interface language: English

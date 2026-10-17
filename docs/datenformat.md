@@ -129,6 +129,23 @@ geändert wird.
 - Beschreibungen (`note`) werden übernommen, sofern sie Text sind; leere entfallen, längere als 2000 Zeichen werden gekürzt.
 - Läufe ohne `history` oder `nodes` werden verworfen; fehlende Metadaten werden ergänzt.
 
+## SVG-Export einer Karte
+
+*Export / Import → Aktuelle Karte (SVG)* erzeugt eine eigenständige SVG-Datei (UTF-8) der Karte, wie sie gerade
+angezeigt wird – bei geöffnetem Lauf mit den Werten und Etiketten der gezeigten Runde. Auswahl und Markierungen werden
+nicht übernommen. Aufbau:
+
+- `<title>` = Kartenname, `<desc>` = Hinweis auf fuzzymap
+- `<style>` mit festen Farben (helles Farbschema, ohne CSS-Variablen und `color-mix`, damit auch Grafikprogramme die
+  Farben zeigen)
+- `<g class="map">` mit Pfeilspitzen, Kanten, Faktor-Etiketten und Knoten (dieselben Klassen und `data-*`-Attribute
+  wie in der App) und danach je Knoten und Kante ein ausgeblendetes `<foreignObject class="tip" data-for="ID">` mit der
+  Hover-Anzeige als XHTML
+
+Die Hover-Anzeige kommt ohne Skript aus: `.node[data-hl="ID"]:hover ~ .tip[data-for="ID"]` blendet das Feld ein,
+das Abblenden der übrigen Elemente nutzt `:has()`. Das funktioniert, wenn die Datei direkt im Browser geöffnet oder per
+`<object>`/inline eingebunden wird; als `<img>` oder in Grafikprogrammen ist die Grafik statisch.
+
 ## CSV-Export eines Laufs
 
 Datei `Kartenname-Laufname.csv`, UTF-8 mit BOM, Zeilenende CRLF. Format nach Sprache der Oberfläche: Deutsch mit

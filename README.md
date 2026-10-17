@@ -295,6 +295,7 @@ Menü **Export / Import**:
 | Funktion | Ergebnis |
 |---|---|
 | *Aktuelle Karte (JSON)* | `Kartenname.fuzzymap.json` – Knoten, Kanten, Simulationseinstellungen, alle Läufe |
+| *Aktuelle Karte (SVG)* | `Kartenname.svg` – Grafik der Karte, wie angezeigt (bei geöffnetem Lauf die gezeigte Runde: `Kartenname-runde-N.svg`). Im Browser geöffnet funktioniert die Hover-Anzeige weiter: Zeiger auf Knoten oder Kante zeigt Text, Wert bzw. Faktor und Beschreibung und blendet den Rest ab – ohne Skript, nur per CSS. In Grafikprogrammen und als `<img>` eingebunden ist die Grafik statisch |
 | *Alle Karten – Sicherung (JSON)* | `fuzzymap-backup-JJJJ-MM-TT.json` – alle Karten |
 | *Aktuellen Lauf (CSV)* | Wertetabelle je Runde und Knoten plus Kantenliste; Deutsch: Semikolon und Dezimalkomma, Englisch: Komma und Dezimalpunkt (jeweils Excel-tauglich) |
 | *JSON-Datei(en) auswählen …* | Import einer oder mehrerer Dateien – oder Dateien einfach ins Fenster ziehen |
@@ -366,7 +367,7 @@ Mitgelieferte Komponenten (Details in [`vendor/LIZENZEN.md`](vendor/LIZENZEN.md)
   `main.mpy` ist trotz der Endung gewöhnlicher Python-Quelltext (kein vorkompilierter MicroPython-Bytecode); im Editor
   die Endung `.mpy` als Python einstellen. Syntax prüfen: `python3 -c "compile(open('main.mpy').read(), 'main.mpy', 'exec')"`.
 - **Cache:** Der Service Worker liefert Dateien zuerst aus dem Cache (*stale-while-revalidate*). Nach Änderungen
-  entweder die Konstante `CACHE` in `sw.js` erhöhen (z. B. von `fuzzymap-v45` auf `fuzzymap-v46`) oder während der Entwicklung in den
+  entweder die Konstante `CACHE` in `sw.js` erhöhen (z. B. von `fuzzymap-v46` auf `fuzzymap-v47`) oder während der Entwicklung in den
   Browser-DevTools *Application → Service Workers → Bypass for network* aktivieren.
 - **Fehlersuche:** Python-Fehler beim Start werden in die Browser-Konsole geschrieben und zusätzlich als Attribut
   `data-err` am `<body>` abgelegt.

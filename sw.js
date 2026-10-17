@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later – Copyright (C) 2026 die Autorinnen und Autoren von fuzzymap
 // Service Worker (Vanilla JS – in PyScript nicht möglich): Offline-Cache.
-const CACHE = "fuzzymap-v45";
+const CACHE = "fuzzymap-v46";
 // Alles, was die App beim Start braucht – liegt vollständig im eigenen Verzeichnis (vendor/).
 // Damit ist die App schon nach dem ersten Laden komplett offline nutzbar.
 const CORE = [

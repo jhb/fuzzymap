@@ -30,7 +30,7 @@ The file is divided into sections (comments `# ------ Section`; the section name
 | Editing (Bearbeiten) | Adding and deleting nodes/edges, modes | `add_node`, `add_edge`, `delete_sel`, `set_mode` |
 | Pointer events (Zeiger-Ereignisse) | Dragging, connecting, panning, pinch zoom | `on_down`, `on_move`, `on_up`, `on_wheel` |
 | Actions (Aktionen) | Handlers for buttons (`data-action`) | `ACTIONS` table, `on_click`, `on_input`, `on_key` |
-| Export / Import | Creating JSON/CSV, reading files, drag & drop, messages | `export_json`, `a_export_run_csv`, `clean_map`, `import_files`, `toast` |
+| Export / Import | Creating JSON/CSV/SVG (`export_svg_text`), reading files, drag & drop, messages | `export_json`, `a_export_run_csv`, `clean_map`, `import_files`, `toast` |
 | Linked hovering (Verknüpftes Hovern) | Shared highlighting across graph, chart and lists; value display in the chart | `apply_hover`, `set_hover`, `on_over`, `chart_tip`, `on_chart_move` |
 | Start | Registering listeners, first render, service worker | `main` |
 
@@ -107,7 +107,8 @@ While drawing, `render_canvas()` stores the position and half height of every no
 every factor label (`EDGE_GEO`) and, in simulation mode, the node values (`NODE_INFO`). `on_over` remembers the node
 (`S["hover"]`, via `data-hl`) and the edge (`S["ehover"]`, via `data-edge`) under the pointer.
 
-`node_tip()` is called from `apply_hover()` or `on_over` and fills a single HTML element (`#node-tip`):
+`node_tip()` is called from `apply_hover()` or `on_over` and fills a single HTML element (`#node-tip`); the content
+comes from `tip_content()`, which the SVG export uses as well (with `xml=True` for well-formed XHTML):
 
 - **Edge:** source → target and factor, positioned at the factor label.
 - **Node without a run:** colour, text and value.

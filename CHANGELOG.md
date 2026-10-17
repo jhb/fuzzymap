@@ -1,5 +1,11 @@
 # Änderungsverlauf
 
+## 45 – SVG-Export
+- Neu: *Export / Import → Aktuelle Karte (SVG)* – Grafik der Karte, wie angezeigt (im Lauf: gezeigte Runde)
+- Die Hover-Anzeige funktioniert in der SVG-Datei weiter (Text, Wert/Faktor, Beschreibung, Abblenden der übrigen
+  Elemente) – ohne Skript, nur per CSS; feste Farben, damit auch Grafikprogramme die Datei korrekt zeigen
+- Inhalt der Hover-Anzeige in `tip_content()` ausgelagert (gemeinsam für App und Export)
+
 ## 44 – Verweis auf die Demo
 - README (DE/EN): Hinweis auf die Demo unter https://baach.de/fuzzymap (Übersicht und Schnellstart)
 

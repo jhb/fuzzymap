@@ -819,12 +819,22 @@ def node_tip():
     if is_none(tip):
         return
     m = cur()
-    nid = S.get("hover")
-    eid = S.get("ehover")
     if not m or S.get("drag") or EDIT.get("id"):
         tip.hidden = True
         return
+    r = tip_content(m, S.get("hover"), S.get("ehover"))
+    if r is None:
+        tip.hidden = True
+        return
+    html, x, y, hh = r
+    node_tip_place(tip, html, x, y, hh)
+
+
+def tip_content(m, nid, eid, xml=False):
+    """Inhalt der Hover-Anzeige für Kante eid bzw. Knoten nid: (HTML, x, y, halbe Höhe) oder None.
+    xml=True liefert wohlgeformtes XHTML (für den SVG-Export)."""
     html = None
+    x = y = hh = 0.0
     ed = edge_by(m, eid) if eid else None
     if ed and eid in EDGE_GEO:
         a, b = node_by(m, ed["src"]), node_by(m, ed["dst"])
@@ -834,7 +844,7 @@ def node_tip():
             a=esc(a["label"] if a else "?"), b=esc(b["label"] if b else "?"),
             arr="↻" if ed["src"] == ed["dst"] else "→", w=fweight(ed["w"]))
         if ed.get("note"):
-            html += '<span class="tip-note">{}</span>'.format(note_html(ed["note"]))
+            html += '<span class="tip-note">{}</span>'.format(note_html(ed["note"], xml))
     elif nid and nid in NODE_GEO:
         n = node_by(m, nid)
         note = (n.get("note") or "") if n else ""
@@ -858,10 +868,13 @@ def node_tip():
                       '<span>Wert: <strong>{val}</strong></span>')).format(
                 col=node_color(m, nid), lab=esc(n["label"] or _("(ohne Text)")), val=fnum(n["value"]))
         if html is not None and note:
-            html += '<span class="tip-note">{}</span>'.format(note_html(note))
+            html += '<span class="tip-note">{}</span>'.format(note_html(note, xml))
     if html is None:
-        tip.hidden = True
-        return
+        return None
+    return html, x, y, hh
+
+
+def node_tip_place(tip, html, x, y, hh):
     v = S["view"]
     fx = (x - v["x"]) / v["w"]
     top = (y - hh - v["y"]) / v["h"]
@@ -916,8 +929,8 @@ def note_field(fid, obj):
         _("Beschreibung"), fid, NOTE_MAX, esc(_("Wird beim Darüberfahren angezeigt")), esc(obj.get("note") or ""))
 
 
-def note_html(t):
-    return esc(t).replace("\n", "<br>")
+def note_html(t, xml=False):
+    return esc(t).replace("\n", "<br/>" if xml else "<br>")
 
 
 def render_inspector():
@@ -2249,6 +2262,154 @@ def a_export_map(b, e):
     toast(_("Karte „{}“ exportiert.").format(m["name"]))
 
 
+def hex_mix(c1, c2, k):
+    """Mischt zwei Hex-Farben (#rrggbb): k = Anteil von c1 (0 … 1)."""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(["{:02x}".format(int(round(a[i] * k + b[i] * (1 - k)))) for i in range(3)])
+
+
+SVG_CSS = """
+.map{font-family:"Plus Jakarta Sans",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;font-variant-numeric:tabular-nums}
+.edge .hit{stroke:transparent;stroke-width:16;fill:none}
+.edge .line{fill:none;stroke-linecap:round;pointer-events:none}
+.edge.pos .line{stroke:#1d7a58}.edge.neg .line{stroke:#b5452e;stroke-dasharray:7 5}.edge.zero .line{stroke:#8f897d;stroke-dasharray:2 5}
+.edge.active .line{stroke-dasharray:10 8;animation:flow .7s linear infinite}
+@keyframes flow{to{stroke-dashoffset:-18}}
+.ah-pos{fill:#1d7a58}.ah-neg{fill:#b5452e}.ah-zero{fill:#8f897d}.ah-sel{fill:#5b5bd6}
+.elabel rect{fill:#fffdf9;stroke:currentColor;stroke-width:1.2}
+.elabel text{font-size:12px;font-weight:700;text-anchor:middle;fill:currentColor}
+.elabel.pos{color:#1d7a58}.elabel.neg{color:#b5452e}.elabel.zero{color:#8f897d}
+.node .body rect{stroke-width:1.8;vector-effect:non-scaling-stroke}
+.node .nl{font-size:13.5px;font-weight:700;text-anchor:middle;fill:#23211d}
+.node .nv{font-size:12.5px;text-anchor:middle;fill:#6b665c}
+.node.up .nv,.node.down .nv{fill:#23211d;font-weight:700}
+.node.pulse .body rect{stroke-width:3}.node.ghost{opacity:.45}.node.negv .body rect{stroke-dasharray:5 3}
+.badge rect{stroke:none}.badge.pos rect{fill:#1d7a58}.badge.neg rect{fill:#b5452e}
+.badge text{fill:#fff;font-size:11.5px;font-weight:700;text-anchor:middle}
+.note-dot{fill:#6b665c;stroke:#fffdf9;stroke-width:1.5;pointer-events:none}
+.node,.edge,.elabel{transition:opacity .15s}
+.node:hover .body rect{stroke-width:3.5}
+.map:has(.node:hover) .node:not(:hover){opacity:.35}
+.map:has(.node:hover) .edge,.map:has(.node:hover) .elabel{opacity:.18}
+.map:has(.edge:hover) .edge:not(:hover),.map:has(.elabel:hover) .edge,.map:has(.edge:hover) .elabel,.map:has(.elabel:hover) .elabel:not(:hover){opacity:.25}
+.tip{display:none;pointer-events:none;overflow:visible}
+.tipwrap{display:flex;justify-content:center;width:100%;height:100%}
+.tip.up .tipwrap{align-items:flex-end}.tip.down .tipwrap{align-items:flex-start}
+.tipbox{display:grid;gap:1px;background:#fffdf9;color:#23211d;border:1px solid #ddd8cd;border-radius:10px;
+box-shadow:0 8px 22px rgba(0,0,0,.16);padding:8px 11px;font-size:13px;line-height:1.45;white-space:nowrap;
+font-family:"Plus Jakarta Sans",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+.tipbox b{font-weight:700;font-size:14px}.tipbox em{font-style:normal;font-weight:700}
+.tipbox em.pos{color:#1d7a58}.tipbox em.neg{color:#b5452e}.tipbox small{color:#6b665c;font-weight:400}
+.tipbox .sw{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:7px;vertical-align:-1px}
+.tipbox .tip-note{white-space:normal;max-width:280px;min-width:160px;margin-top:4px;padding-top:5px;border-top:1px solid #ddd8cd}
+@media (prefers-reduced-motion:reduce){.edge.active .line{animation:none}.node,.edge,.elabel{transition:none}}
+"""
+
+
+def strip_bg(html):
+    """Entfernt das Punkteraster-Rechteck (class="bg") aus dem serialisierten SVG-Inhalt."""
+    i = html.find('class="bg"')
+    if i < 0:
+        return html
+    a = html.rfind("<rect", 0, i)
+    b = html.find("</rect>", i)
+    if b >= 0 and html.find(">", i) == html.find("></rect>", i):
+        return html[:a] + html[b + 7:]
+    b = html.find("/>", i)
+    return html[:a] + html[b + 2:] if b >= 0 else html
+
+
+def export_svg_text():
+    """Eigenständige SVG-Datei der aktuellen Karte (im geöffneten Lauf: die angezeigte Runde).
+    Die Hover-Anzeige funktioniert ohne Skript: je Knoten/Kante ein ausgeblendetes Feld (foreignObject),
+    das per CSS beim Zeigen eingeblendet wird; Abblenden der übrigen Elemente über :has()."""
+    m = cur()
+    keep = (S["sel"], S["pending"], S["hover"], S.get("ehover"), S["temp"])
+    S["sel"], S["pending"], S["hover"], S["ehover"], S["temp"] = None, None, None, None, None
+    render_canvas()
+    inner = strip_bg(str(el("canvas").innerHTML))
+    rs = run_state()
+    sc = node_scales(m, rs)
+    # Grenzen: Knotenrechtecke, Schleifenbögen, Etiketten
+    xs, ys = [], []
+    for n in m["nodes"]:
+        w, h = node_size(n)
+        f = sc.get(n["id"], 1.0)
+        xs += [n["x"] - w * f / 2, n["x"] + w * f / 2]
+        ys += [n["y"] - h * f / 2 - 16, n["y"] + h * f / 2]
+        for e in m["edges"]:
+            if e["src"] == n["id"] and e["dst"] == n["id"]:
+                ux, uy = loop_side(m, n)
+                r = (h * f if uy != 0 else w * f) / 2.0 + 46.0
+                xs.append(n["x"] + ux * r)
+                ys.append(n["y"] + uy * r)
+    for k in EDGE_GEO:
+        lx, ly = EDGE_GEO[k]
+        xs += [lx - 30, lx + 30]
+        ys += [ly - 12, ly + 12]
+    if not xs:
+        xs, ys = [-200.0, 200.0], [-120.0, 120.0]
+    pad = 36.0
+    x0, x1, y0, y1 = min(xs) - pad, max(xs) + pad, min(ys) - pad, max(ys) + pad
+    W, H = x1 - x0, y1 - y0
+    # Knotenfarben als feste Werte (ohne CSS-Variablen/color-mix, damit auch Grafikprogramme sie zeigen)
+    css = [SVG_CSS]
+    for n in m["nodes"]:
+        nc = node_color(m, n["id"])
+        k = 0.14
+        if rs:
+            run, now, prev, start, t = rs
+            if n["id"] in now:
+                s0 = start[n["id"]]
+                dv = now[n["id"]] - s0
+                if abs(dv) > 1e-9 * max(1.0, abs(s0)):
+                    k = (22 + 50 * (clamp(abs(dv) / abs(s0), 0.0, 1.0) if s0 else 1.0)) / 100.0
+        css.append('.node[data-node="{0}"] .body rect{{fill:{1};stroke:{2}}}'.format(n["id"], hex_mix(nc, "#fffdf9", k), nc))
+        css.append('.node[data-hl="{0}"]:hover~.tip[data-for="{0}"]{{display:block}}'.format(n["id"]))
+        css.append('.map:has(.node[data-hl="{0}"]:hover) [data-ends~="{0}"]{{opacity:1}}'.format(n["id"]))
+    for e in m["edges"]:
+        css.append('[data-edge="{0}"]:hover~.tip[data-for="{0}"]{{display:block}}'.format(e["id"]))
+        css.append('.map:has([data-edge="{0}"]:hover) [data-edge="{0}"][data-ends]{{opacity:1}}'.format(e["id"]))
+    # Hover-Felder
+    TW, TH = 320.0, 300.0
+    tips = []
+    items = [(None, e["id"]) for e in m["edges"]] + [(n["id"], None) for n in m["nodes"]]
+    for nid, eid in items:
+        r = tip_content(m, nid, eid, True)
+        if r is None:
+            continue
+        html, x, y, hh = r
+        up = (y - hh - y0) >= 150 or (y1 - (y + hh)) < (y - hh - y0)
+        fx = clamp(x - TW / 2, x0, x1 - TW) if W > TW else x0
+        fy = (y - hh - 8 - TH) if up else (y + hh + 8)
+        tips.append('<foreignObject class="tip {}" data-for="{}" x="{:.1f}" y="{:.1f}" width="{:.0f}" height="{:.0f}">'
+                    '<div xmlns="http://www.w3.org/1999/xhtml" class="tipwrap"><div class="tipbox">{}</div></div>'
+                    '</foreignObject>'.format("up" if up else "down", nid or eid, fx, fy, TW, TH, html))
+    title = esc(m["name"])
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="{:.1f} {:.1f} {:.1f} {:.1f}" width="{:.0f}" height="{:.0f}">\n'
+            '<title>{}</title>\n<desc>{}</desc>\n<style>{}</style>\n'
+            '<rect x="{:.1f}" y="{:.1f}" width="{:.1f}" height="{:.1f}" fill="#f6f4ef"/>\n'
+            '<g class="map">{}{}</g>\n</svg>\n').format(
+        x0, y0, W, H, W, H, title, esc(_("Exportiert aus fuzzymap – Zeiger auf Knoten oder Kanten zeigt Werte und Beschreibungen.")),
+        "\n".join(css), x0, y0, W, H, inner, "".join(tips)), keep
+
+
+def a_export_svg(b, e):
+    m = cur()
+    if not m:
+        return
+    txt, keep = export_svg_text()
+    S["sel"], S["pending"], S["hover"], S["ehover"], S["temp"] = keep
+    render_canvas()
+    suffix = "-runde-{}".format(S["round"]) if S.get("run") else ""
+    if S.get("run") and is_en():
+        suffix = "-round-{}".format(S["round"])
+    download(txt, safe_name(m["name"], "karte") + suffix + ".svg", "image/svg+xml")
+    toast(_("Karte „{}“ als SVG exportiert.").format(m["name"]))
+
+
 def a_export_all(b, e):
     download(export_json(S["maps"]), "fuzzymap-backup-{}.json".format(today()), "application/json")
     toast(_("{} Karten als Sicherung exportiert.").format(len(S["maps"])))
@@ -2668,7 +2829,7 @@ ACTIONS = {
     "fit": lambda b, e: fit(), "toggle-size": lambda b, e: toggle_size(), "fullmap": lambda b, e: set_fullmap(not FULL["on"]),
     "help": lambda b, e: el("help").showModal(),
     "map-new": a_map_new, "map-rename": a_map_rename, "map-dup": a_map_dup, "map-sample": a_map_sample, "map-undo": a_map_undo,
-    "map-delete": a_map_delete, "export-map": a_export_map, "export-all": a_export_all,
+    "map-delete": a_map_delete, "export-map": a_export_map, "export-svg": a_export_svg, "export-all": a_export_all,
     "export-run-csv": a_export_run_csv, "import": a_import,
     "select-node": a_select_node, "select-edge": a_select_edge, "delete-sel": lambda b, e: delete_sel(),
     "edge-set": a_edge_set, "edge-reverse": a_edge_reverse, "edge-from-sel": a_edge_from_sel, "edge-self": a_edge_self, "chart-y": a_chart_y,
@@ -2986,6 +3147,8 @@ def listen(target, ev, fn, opts=None):
 EN = {
     " (Kopie)": " (copy)",
     " (importiert)": " (imported)",
+    "Karte „{}“ als SVG exportiert.": "Map “{}” exported as SVG.",
+    "Exportiert aus fuzzymap – Zeiger auf Knoten oder Kanten zeigt Werte und Beschreibungen.": "Exported from fuzzymap – pointing at nodes or edges shows values and descriptions.",
     "Der Browser erlaubt hier kein Vollbild – die Karte füllt das Fenster.": "The browser does not allow full screen here – the map fills the window.",
     "Beispielkarte „{}“ hinzugefügt": "Sample map “{}” added",
     " <small>(Start 0, kein %)</small>": " <small>(start 0, no %)</small>",
@@ -3118,6 +3281,7 @@ EN_STATIC = {
     "delete": "Delete",
     "export": "Export",
     "exportMap": "Current map (JSON)",
+    "exportSvg": "Current map (SVG)",
     "exportAll": "All maps – backup (JSON)",
     "exportRun": "Current run (CSV)",
     "import": "Import",

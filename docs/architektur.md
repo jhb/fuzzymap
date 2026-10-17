@@ -30,7 +30,7 @@ Die Datei ist in Abschnitte gegliedert (Kommentare `# ------ Abschnitt`):
 | Bearbeiten | Knoten/Kanten anlegen und löschen, Modi | `add_node`, `add_edge`, `delete_sel`, `set_mode` |
 | Zeiger-Ereignisse | Ziehen, Verbinden, Verschieben, Pinch-Zoom | `on_down`, `on_move`, `on_up`, `on_wheel` |
 | Aktionen | Handler für Buttons (`data-action`) | `ACTIONS`-Tabelle, `on_click`, `on_input`, `on_key` |
-| Export / Import | JSON/CSV erzeugen, Dateien einlesen, Drag & Drop, Meldungen | `export_json`, `a_export_run_csv`, `clean_map`, `import_files`, `toast` |
+| Export / Import | JSON/CSV/SVG erzeugen (`export_svg_text`), Dateien einlesen, Drag & Drop, Meldungen | `export_json`, `a_export_run_csv`, `clean_map`, `import_files`, `toast` |
 | Verknüpftes Hovern | Gemeinsame Markierung über Graph, Diagramm, Listen; Werteanzeige im Diagramm | `apply_hover`, `set_hover`, `on_over`, `chart_tip`, `on_chart_move` |
 | Start | Listener registrieren, erstes Rendering, Service Worker | `main` |
 
@@ -109,7 +109,8 @@ Anlegen: zweiter Tipp auf den vorgemerkten Knoten im Kantenmodus, Ziehen mit Ver
 Faktor-Etiketts (`EDGE_GEO`) und im Simulationsmodus die Werte der Knoten (`NODE_INFO`) ab. `on_over` merkt sich den
 Knoten (`S["hover"]`, über `data-hl`) und die Kante (`S["ehover"]`, über `data-edge`) unter dem Zeiger.
 
-`node_tip()` wird aus `apply_hover()` bzw. `on_over` aufgerufen und füllt ein einziges HTML-Feld (`#node-tip`):
+`node_tip()` wird aus `apply_hover()` bzw. `on_over` aufgerufen und füllt ein einziges HTML-Feld (`#node-tip`); den
+Inhalt liefert `tip_content()`, die auch der SVG-Export nutzt (mit `xml=True` für wohlgeformtes XHTML):
 
 - **Kante:** Start → Ziel und Faktor, positioniert am Faktor-Etikett.
 - **Knoten ohne Lauf:** Farbe, Text und Wert.
