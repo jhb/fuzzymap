@@ -13,6 +13,7 @@ Kanten einen Faktor, der angibt, wie stark eine Änderung des Startknotens auf d
 - **Keine fremden Server:** PyScript, MicroPython und die Schrift werden mitgeliefert (`vendor/`); zur Laufzeit wird
   nichts von Dritten nachgeladen
 - **Freie Software** unter der [GNU Affero General Public License v3.0 oder später](LICENSE) (AGPL-3.0-or-later)
+- **Demo:** <https://baach.de/fuzzymap> – direkt im Browser ausprobieren
 - **Quellcode:** <https://github.com/jhb/fuzzymap>
 
 > **Per Vibe Coding entstanden.** fuzzymap ist vollständig durch *Vibe Coding* entstanden: Code, Oberflächentexte und
@@ -91,6 +92,8 @@ Details im Abschnitt [Simulationsmodell](#simulationsmodell).
 ---
 
 ## Schnellstart
+
+Zum Ausprobieren ohne Installation: Demo unter <https://baach.de/fuzzymap>. Für eine eigene Kopie:
 
 PyScript lädt `main.mpy` per HTTP – die App muss deshalb über einen Webserver laufen, nicht per `file://`.
 

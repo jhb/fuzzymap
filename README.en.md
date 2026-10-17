@@ -13,6 +13,7 @@ of the source node carries over to the target node.
 - **No third-party servers:** PyScript, MicroPython and the font are bundled (`vendor/`); nothing is loaded from
   third parties at runtime
 - **Free software** under the [GNU Affero General Public License v3.0 or later](LICENSE) (AGPL-3.0-or-later)
+- **Demo:** <https://baach.de/fuzzymap> – try it right in the browser
 - **Source code:** <https://github.com/jhb/fuzzymap>
 
 > **Built by vibe coding.** fuzzymap was created entirely through *vibe coding*: code, interface texts and
@@ -91,6 +92,8 @@ weights between −1 and +1 and a threshold function (e.g. sigmoid). fuzzymap de
 ---
 
 ## Quick start
+
+To try it without installing anything: demo at <https://baach.de/fuzzymap>. For your own copy:
 
 PyScript loads `main.mpy` via HTTP – the app therefore has to be served by a web server, not via `file://`.
 

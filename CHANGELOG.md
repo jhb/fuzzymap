@@ -1,5 +1,8 @@
 # Änderungsverlauf
 
+## 44 – Verweis auf die Demo
+- README (DE/EN): Hinweis auf die Demo unter https://baach.de/fuzzymap (Übersicht und Schnellstart)
+
 ## 43 – Verweis auf GitHub
 - Verweis auf das Repository https://github.com/jhb/fuzzymap (README DE/EN, Hilfe *Über fuzzymap*, Kopfkommentare)
 
